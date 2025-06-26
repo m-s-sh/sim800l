@@ -20,6 +20,10 @@ profile.cov
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
+# Temporary
+bin/
+example/
+
 # Go workspace file
 go.work
 go.work.sum
@@ -29,4 +33,7 @@ go.work.sum
 
 # Editor/IDE
 # .idea/
-# .vscode/
+.vscode/
+
+# 3rd party
+docs/

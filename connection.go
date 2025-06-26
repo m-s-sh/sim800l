@@ -1,0 +1,159 @@
+// Package sim800l implements a driver for the SIM800L GSM/GPRS module.
+// This file contains the net.Conn implementation for Connection objects.
+package sim800l
+
+import (
+	"errors"
+	"io"
+	"net"
+	"time"
+)
+
+// Connection represents a single connection to a remote server
+// Connection already defined in sim800l.go
+
+// Read reads data from the connection
+// Implements the net.Conn interface
+func (c *Connection) Read(b []byte) (int, error) {
+	// Check if connection is valid
+	if c == nil || c.Device == nil {
+		return 0, errors.New("invalid connection")
+	}
+
+	// Check connection state
+	if c.State != StateConnected {
+		return 0, io.EOF
+	}
+
+	// Use the module's connection read implementation
+	return c.Device.ConnectionRead(c.ID, b)
+}
+
+// Write writes data to the connection
+// Implements the net.Conn interface
+func (c *Connection) Write(b []byte) (int, error) {
+	// Check if connection is valid
+	if c == nil || c.Device == nil {
+		return 0, errors.New("invalid connection")
+	}
+
+	// Check connection state
+	if c.State != StateConnected {
+		return 0, errors.New("connection not established")
+	}
+
+	// Use the module's SendData function
+	return c.Device.SendData(c.ID, b)
+}
+
+// Close closes the connection
+// Implements the net.Conn interface
+func (c *Connection) Close() error {
+	// Check if connection is valid
+	if c == nil || c.Device == nil {
+		return errors.New("invalid connection")
+	}
+
+	// Use the module's CloseConnection function
+	return c.Device.CloseConnection(c.ID)
+}
+
+// LocalAddr returns the local network address
+// Implements the net.Conn interface
+func (c *Connection) LocalAddr() net.Addr {
+	if c == nil || c.Device == nil || c.Device.IP == "" {
+		return nil
+	}
+
+	// Create a simple implementation of net.Addr
+	return simpleAddr{
+		network: c.networkString(),
+		address: c.Device.IP,
+	}
+}
+
+// RemoteAddr returns the remote network address
+// Implements the net.Conn interface
+func (c *Connection) RemoteAddr() net.Addr {
+	if c == nil || c.RemoteIP == "" {
+		return nil
+	}
+
+	// Create a simple implementation of net.Addr
+	return simpleAddr{
+		network: c.networkString(),
+		address: c.RemoteIP + ":" + c.RemotePort,
+	}
+}
+
+// SetDeadline sets the read and write deadlines
+// Note: This implementation is a placeholder, as the SIM800L doesn't support precise deadlines
+func (c *Connection) SetDeadline(t time.Time) error {
+	// Not fully implemented due to SIM800L limitations
+	return nil
+}
+
+// SetReadDeadline sets the read deadline
+// Note: This implementation is a placeholder, as the SIM800L doesn't support precise deadlines
+func (c *Connection) SetReadDeadline(t time.Time) error {
+	// Not fully implemented due to SIM800L limitations
+	return nil
+}
+
+// SetWriteDeadline sets the write deadline
+// Note: This implementation is a placeholder, as the SIM800L doesn't support precise deadlines
+func (c *Connection) SetWriteDeadline(t time.Time) error {
+	// Not fully implemented due to SIM800L limitations
+	return nil
+}
+
+// networkString returns the network type as a string
+func (c *Connection) networkString() string {
+	if c.Type == TCP {
+		return "tcp"
+	}
+	return "udp"
+}
+
+// simpleAddr implements the net.Addr interface
+type simpleAddr struct {
+	network string
+	address string
+}
+
+func (a simpleAddr) Network() string {
+	return a.network
+}
+
+func (a simpleAddr) String() string {
+	return a.address
+}
+
+// IsConnected returns true if the connection is active
+func (c *Connection) IsConnected() bool {
+	return c != nil && c.State == StateConnected
+}
+
+// GetState returns the current connection state as a string
+func (c *Connection) GetState() string {
+	if c == nil {
+		return "INVALID"
+	}
+
+	switch c.State {
+	case StateInitial:
+		return "INITIAL"
+	case StateConnecting:
+		return "CONNECTING"
+	case StateConnected:
+		return "CONNECTED"
+	case StateClosing:
+		return "CLOSING"
+	case StateClosed:
+		return "CLOSED"
+	case StateError:
+		return "ERROR"
+	default:
+		return "UNKNOWN"
+	}
+}
