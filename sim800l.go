@@ -210,6 +210,10 @@ func (d *Device) HardReset() error {
 	return nil
 }
 
+// ResponseCheckFunc is a callback function type that can be used to check if
+// we have received a complete response and should stop reading
+type ResponseCheckFunc func(buffer []byte) bool
+
 // Response represents a parsed AT command response
 type Response struct {
 	Command       string            // Original command
@@ -217,7 +221,7 @@ type Response struct {
 	Values        map[string]string // Parsed name-value pairs
 	Raw           []byte            // Raw response bytes
 	Timeout       bool              // Whether a timeout occurred
-	WaitOKPattern bool              // Whether to wait for "OK" response
+	checkResponse ResponseCheckFunc // Optional callback to check if response is complete
 }
 
 // Success returns true if the response is successful (no timeout)
@@ -227,15 +231,15 @@ func (r *Response) Success() bool {
 
 // send is a simplified version of sendWithOptions that always waits for OK pattern
 func (d *Device) send(cmd string, timeout time.Duration) (*Response, error) {
-	return d.sendWithOptions(cmd, true, timeout)
+	return d.sendWithOptions(cmd, nil, timeout)
 }
 
 // sendWithOptions sends a command with customizable waiting behavior
-func (d *Device) sendWithOptions(cmd string, waitForOk bool, timeout time.Duration) (*Response, error) {
+func (d *Device) sendWithOptions(cmd string, checkFunc ResponseCheckFunc, timeout time.Duration) (*Response, error) {
 	resp := &Response{
 		Command:       cmd,
 		Values:        make(map[string]string),
-		WaitOKPattern: waitForOk,
+		checkResponse: checkFunc,
 	}
 
 	// Clear UART buffer before sending
@@ -285,24 +289,29 @@ func (d *Device) readResponse(resp *Response, timeout time.Duration) error {
 
 		// Read a byte
 		n, err := d.uart.Read(tempBuf)
-		if err != nil || n == 0 {
+		if err != nil && n == 0 {
 			continue
 		}
 
 		// Add to buffer
 		buffer.WriteByte(tempBuf[0])
 
-		// Check for OK or ERROR
-		if buffer.Len() >= 2 && tempBuf[0] == '\n' {
-			if bytes.Contains(buffer.Bytes(), []byte(ErrorText)) {
-				rerr = &ATError{
-					Command: resp.Command,
-					Message: ErrorText,
+		if resp.checkResponse != nil && resp.checkResponse(buffer.Bytes()) {
+			// If we are not waiting for OK, we can break on any line ending
+			break
+		} else if resp.checkResponse == nil {
+			// Check for OK or ERROR responses and custom checks
+			if buffer.Len() >= 2 && tempBuf[0] == '\n' {
+				if bytes.Contains(buffer.Bytes(), []byte(ErrorText)) {
+					rerr = &ATError{
+						Command: resp.Command,
+						Message: ErrorText,
+					}
+					break
 				}
-				break
-			}
-			if !resp.WaitOKPattern || bytes.Contains(buffer.Bytes(), []byte(OKText)) {
-				break
+				if bytes.Contains(buffer.Bytes(), []byte(OKText)) {
+					break
+				}
 			}
 		}
 
@@ -316,6 +325,7 @@ func (d *Device) readResponse(resp *Response, timeout time.Duration) error {
 			}
 			break
 		}
+
 	}
 
 	// Check for timeout

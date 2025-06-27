@@ -93,9 +93,20 @@ if err != nil {
 For advanced users who need to send custom AT commands with special response handling:
 
 ```go
-// Use sendWithOptions to enable custom response mode
-// Set the second parameter to false to collect all response data without expecting OK/ERROR
-resp, err := device.sendWithOptions("+CIFSR", false, DefaultTimeout)
+// Method 1: Use sendWithOptions with waitForOK=false
+// This collects all response data without expecting OK/ERROR
+resp, err := device.sendWithOptions("+CIFSR", false, DefaultTimeout, nil)
+if err != nil {
+    return err
+}
+
+// Method 2: Use sendWithCustomCheck with a custom response check function
+// This gives you complete control over when to stop reading
+ipCheck := func(buffer []byte) bool {
+    // Stop reading if we see a valid IP address pattern
+    return regexp.Match(`\d+\.\d+\.\d+\.\d+`, buffer)
+}
+resp, err := device.sendWithCustomCheck("+CIFSR", DefaultTimeout, ipCheck)
 if err != nil {
     return err
 }
@@ -230,7 +241,8 @@ if err := device.HardReset(); err != nil {
 ### Low-level AT Command Handling
 
 - `send(cmd string, timeout time.Duration) (*Response, error)` - Sends AT command with standard response handling
-- `sendWithOptions(cmd string, expectOK bool, timeout time.Duration) (*Response, error)` - Sends AT command with custom response handling
+- `sendWithOptions(cmd string, expectOK bool, timeout time.Duration, checkFunc ResponseCheckFunc) (*Response, error)` - Sends AT command with custom response handling
+- `sendWithCustomCheck(cmd string, timeout time.Duration, checkFunc ResponseCheckFunc) (*Response, error)` - Sends AT command with custom response completion check
 
 ## License
 

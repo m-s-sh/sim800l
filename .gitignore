@@ -22,7 +22,7 @@ profile.cov
 
 # Temporary
 bin/
-example/
+ 
 
 # Go workspace file
 go.work
@@ -37,3 +37,9 @@ go.work.sum
 
 # 3rd party
 docs/
+
+# Mac OS
+.DS_Store
+
+# Configuration
+config_*.go

@@ -26,7 +26,7 @@ func (c *Connection) Read(b []byte) (int, error) {
 	}
 
 	// Use the module's connection read implementation
-	return c.Device.ConnectionRead(c.ID, b)
+	return c.Device.connectionRead(c.ID, b)
 }
 
 // Write writes data to the connection
@@ -43,7 +43,7 @@ func (c *Connection) Write(b []byte) (int, error) {
 	}
 
 	// Use the module's SendData function
-	return c.Device.SendData(c.ID, b)
+	return c.Device.connectionSend(c.ID, b)
 }
 
 // Close closes the connection

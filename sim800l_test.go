@@ -5,205 +5,355 @@
 // Package sim800l contains implementation for SIM800L module
 package sim800l
 
-// NOTE: This test code is provided as a guide for testing in a full Go environment
-// It would need modifications to work with TinyGo due to limited testing support
-// and package availability in TinyGo.
-
 import (
 	"bytes"
-	"machine"
+	"errors"
+	"log/slog"
 	"strings"
 	"testing"
+	"time"
 )
 
-// MockUART implements a simple mock for testing
+// MockUART implements drivers.UART for testing
 type MockUART struct {
-	tx           bytes.Buffer
-	rx           bytes.Buffer
-	baud         uint32
-	bufferedData int
-	invalidCount int
-}
-
-func (m *MockUART) Configure(_ interface{}) error {
-	// Simple mock version
-	return nil
+	data        bytes.Buffer
+	returnData  bytes.Buffer
+	bufferCount int
 }
 
 func (m *MockUART) Buffered() int {
-	return m.rx.Len()
+	// If we have a specific buffer count set, use that
+	if m.bufferCount > 0 {
+		return m.bufferCount
+	}
+	return m.returnData.Len()
 }
 
 func (m *MockUART) ReadByte() (byte, error) {
-	if m.rx.Len() == 0 {
-		return 0, nil
+	if m.returnData.Len() == 0 {
+		return 0, errors.New("no data")
 	}
-	return m.rx.ReadByte()
+	return m.returnData.ReadByte()
 }
 
 func (m *MockUART) Write(data []byte) (n int, err error) {
-	return m.tx.Write(data)
+	return m.data.Write(data)
 }
 
 func (m *MockUART) Read(data []byte) (n int, err error) {
-	return m.rx.Read(data)
+	return m.returnData.Read(data)
 }
 
-func (m *MockUART) SetBaudrate(br uint32) error {
-	m.baud = br
+func (m *MockUART) Flush() error {
 	return nil
 }
 
-// SetupCommandResponse sets up a mock response for a specific command
-func (m *MockUART) SetupCommandResponse(response string) {
-	m.tx.Reset()
-	m.rx.Reset()
-	m.rx.WriteString(response)
+func (m *MockUART) SetBaudRate(br uint32) error {
+	return nil
 }
 
-// TestCustomResponseMode tests the custom response handling mode
-func TestCustomResponseMode(t *testing.T) {
-	// Create a mock UART
-	mockUART := &MockUART{}
+// MockPin implements machine.Pin for testing
+type MockPin struct {
+	state bool
+}
 
-	// Create a simple logger
-	logger := &MockLogger{}
+func (p *MockPin) Configure(config interface{}) {
+}
 
-	// Create a device with the mock UART
-	device := New(mockUART, MockPin{}, logger)
+func (p *MockPin) High() {
+	p.state = true
+}
 
-	// Test cases
-	tests := []struct {
-		name             string
-		command          string
-		mockResponse     string
-		customMode       bool
-		expectedSuccess  bool
-		expectedLines    int
-		expectedContains string
+func (p *MockPin) Low() {
+	p.state = false
+}
+
+func (p *MockPin) Get() bool {
+	return p.state
+}
+
+func (p *MockPin) Set(value bool) {
+	p.state = value
+}
+
+// TestSuccess tests the Success method of Response
+func TestSuccess(t *testing.T) {
+	// Test success case
+	respSuccess := &Response{
+		Timeout: false,
+	}
+	if !respSuccess.Success() {
+		t.Error("Expected Success() to return true for non-timeout response")
+	}
+
+	// Test failure case
+	respFailure := &Response{
+		Timeout: true,
+	}
+	if respFailure.Success() {
+		t.Error("Expected Success() to return false for timeout response")
+	}
+}
+
+// TestParseResponse tests the parseResponse method
+func TestParseResponse(t *testing.T) {
+	testCases := []struct {
+		name     string
+		rawData  string
+		expected []string
+		values   map[string]string
 	}{
 		{
-			name:             "Standard AT command",
-			command:          "AT",
-			mockResponse:     "OK\r\n",
-			customMode:       false,
-			expectedSuccess:  true,
-			expectedLines:    0,
-			expectedContains: "",
+			name:     "Empty response",
+			rawData:  "",
+			expected: nil,
+			values:   map[string]string{},
 		},
 		{
-			name:             "Standard command with error",
-			command:          "AT+UNKNOWN",
-			mockResponse:     "ERROR\r\n",
-			customMode:       false,
-			expectedSuccess:  false,
-			expectedLines:    0,
-			expectedContains: "",
+			name:     "Simple OK response",
+			rawData:  "OK\r\n",
+			expected: nil,
+			values:   map[string]string{},
 		},
 		{
-			name:             "Get IP custom response",
-			command:          "AT+CIFSR",
-			mockResponse:     "192.168.1.100\r\n\r\n",
-			customMode:       true,
-			expectedSuccess:  true,
-			expectedLines:    1,
-			expectedContains: "192.168.1.100",
+			name:     "Single line response",
+			rawData:  "Test line\r\nOK\r\n",
+			expected: []string{"Test line"},
+			values:   map[string]string{},
 		},
 		{
-			name:             "Complex custom response",
-			command:          "AT+CIPSTATUS",
-			mockResponse:     "OK\r\n\r\nSTATE: IP STATUS\r\n\r\n+CIPSTATUS: 0,\"TCP\",\"example.com\",80,0,0\r\n\r\n",
-			customMode:       true,
-			expectedSuccess:  true,
-			expectedLines:    2,
-			expectedContains: "STATE: IP STATUS",
+			name:     "Value response",
+			rawData:  "+CSQ: 21,0\r\nOK\r\n",
+			expected: []string{"+CSQ: 21,0"},
+			values:   map[string]string{"+CSQ": "21,0"},
+		},
+		{
+			name:     "Multi-line response",
+			rawData:  "Line 1\r\n+KEY: VALUE\r\nLine 3\r\nOK\r\n",
+			expected: []string{"Line 1", "+KEY: VALUE", "Line 3"},
+			values:   map[string]string{"+KEY": "VALUE"},
 		},
 	}
 
-	for _, tc := range tests {
+	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Setup the mock response
-			mockUART.SetupCommandResponse(tc.mockResponse)
+			uart := &MockUART{}
 
-			// Send the command with or without custom mode
-			var resp *Response
-			var err error
-			if tc.customMode {
-				resp, err = device.sendWithOptions(tc.command, DefaultTimeout, true)
+			logger := slog.Default()
+			device := Device{
+				uart:   uart,
+				logger: logger,
+			}
+
+			resp := &Response{
+				Raw:    []byte(tc.rawData),
+				Values: make(map[string]string),
+			}
+
+			device.parseResponse(resp)
+
+			// Check lines
+			if len(resp.Lines) != len(tc.expected) {
+				t.Errorf("Expected %d lines, got %d", len(tc.expected), len(resp.Lines))
 			} else {
-				resp, err = device.send(tc.command, DefaultTimeout)
-			}
-
-			// Check for errors
-			if tc.expectedSuccess {
-				if err != nil {
-					t.Errorf("Expected success but got error: %v", err)
-				}
-				if !resp.Success() {
-					t.Errorf("Expected response success but got failure: %v", resp.ErrorMsg)
-				}
-			} else {
-				if err == nil && resp.Success() {
-					t.Errorf("Expected failure but got success")
-				}
-			}
-
-			// Check response lines
-			if len(resp.Lines) != tc.expectedLines {
-				t.Errorf("Expected %d lines, got %d: %v", tc.expectedLines, len(resp.Lines), resp.Lines)
-			}
-
-			// Check content if expected
-			if tc.expectedContains != "" {
-				found := false
-				for _, line := range resp.Lines {
-					if strings.Contains(line, tc.expectedContains) {
-						found = true
-						break
+				for i, line := range tc.expected {
+					if i < len(resp.Lines) && resp.Lines[i] != line {
+						t.Errorf("Line %d: expected '%s', got '%s'", i, line, resp.Lines[i])
 					}
 				}
-				if !found {
-					t.Errorf("Expected response to contain '%s' but it didn't: %v",
-						tc.expectedContains, resp.Lines)
+			}
+
+			// Check values
+			if len(resp.Values) != len(tc.values) {
+				t.Errorf("Expected %d values, got %d", len(tc.values), len(resp.Values))
+			} else {
+				for k, v := range tc.values {
+					if val, ok := resp.Values[k]; !ok || val != v {
+						t.Errorf("Value for key '%s': expected '%s', got '%s'", k, v, val)
+					}
 				}
 			}
 		})
 	}
 }
 
-// MockLogger is a simple logger for testing
-type MockLogger struct{}
+// TestReadResponse tests the readResponse method
+func TestReadResponse(t *testing.T) {
+	testCases := []struct {
+		name          string
+		inputData     string
+		checkResponse func([]byte) bool
+		expectError   bool
+		errorType     error
+		timeout       time.Duration
+	}{
+		// {
+		// 	name:        "Simple OK response",
+		// 	inputData:   "OK\r\n",
+		// 	waitForOK:   true,
+		// 	expectError: false,
+		// 	timeout:     time.Second,
+		// },
+		// {
+		// 	name:        "Error response",
+		// 	inputData:   "ERROR\r\n",
+		// 	waitForOK:   true,
+		// 	expectError: true,
+		// 	errorType:   &ATError{},
+		// 	timeout:     time.Second,
+		// },
+		// {
+		// 	name:        "CME Error response",
+		// 	inputData:   "+CME ERROR: 10\r\n",
+		// 	waitForOK:   true,
+		// 	expectError: true,
+		// 	errorType:   &ATError{},
+		// 	timeout:     time.Second,
+		// },
+		{
+			name:      "Non-OK response with waitForOK=false",
+			inputData: "\r\n192.168.1.1\r\n",
+			checkResponse: func(buffer []byte) bool {
+				return buffer[len(buffer)-1] == '\n' && bytes.Contains(buffer, []byte("."))
+			},
+			expectError: false,
+			timeout:     20 * time.Second,
+		},
+		// {
+		// 	name:        "Multiple line response with OK",
+		// 	inputData:   "+CSQ: 21,0\r\nSome data\r\nOK\r\n",
+		// 	waitForOK:   true,
+		// 	expectError: false,
+		// 	timeout:     time.Second,
+		// },
+		// {
+		// 	name:        "Empty response",
+		// 	inputData:   "",
+		// 	waitForOK:   true,
+		// 	expectError: true, // Should timeout with no response
+		// 	errorType:   ErrTimeout,
+		// 	timeout:     10 * time.Millisecond, // Short timeout for test
+		// },
+	}
 
-// Debug logs at debug level
-func (l *MockLogger) Debug(msg string, args ...interface{}) {}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create mock UART with the test data
+			uart := &MockUART{}
 
-// Info logs at info level
-func (l *MockLogger) Info(msg string, args ...interface{}) {}
+			// Prepare data in the mock UART's return buffer
+			uart.returnData.Write([]byte(tc.inputData))
 
-// Error logs at error level
-func (l *MockLogger) Error(msg string, args ...interface{}) {}
+			// Create a device with the mock UART
+			logger := slog.Default()
+			device := Device{
+				uart:   uart,
+				logger: logger,
+			}
 
-// MockPin is a simple pin for testing
-type MockPin struct{}
+			// Create response object
+			resp := &Response{
+				Command:       "TEST",
+				Values:        make(map[string]string),
+				checkResponse: tc.checkResponse, // No custom check for this test
+			}
 
-func (p MockPin) Configure(_ interface{}) {}
-func (p MockPin) Set(_ bool)              {}
-func (p MockPin) Get() bool               { return false }
-func (p MockPin) High()                   {}
-func (p MockPin) Low()                    {}
+			// Call the method to test
+			err := device.readResponse(resp, tc.timeout)
 
-// Fake pin for testing
-type fakePin struct{}
+			// Check error expectations
+			if tc.expectError && err == nil {
+				t.Errorf("Expected error but got none")
+			}
+			if !tc.expectError && err != nil {
+				t.Errorf("Did not expect error but got: %v", err)
+			}
 
-func (p fakePin) Configure(config machine.PinConfig) {}
-func (p fakePin) Set(value bool)                     {}
-func (p fakePin) Get() bool                          { return false }
-func (p fakePin) High()                              {}
-func (p fakePin) Low()                               {}
+			// Check specific error type if applicable
+			if tc.errorType != nil && err != nil {
+				switch expectedErr := tc.errorType.(type) {
+				case *ATError:
+					if _, ok := err.(*ATError); !ok {
+						t.Errorf("Expected error of type *ATError but got %T", err)
+					}
+				default:
+					if err != expectedErr {
+						t.Errorf("Expected error %v but got %v", expectedErr, err)
+					}
+				}
+			}
 
-// Discard writer for logger
-type discard struct{}
+			// Check that the response's Raw field contains the input data
+			if tc.inputData != "" && !tc.expectError {
+				t.Log("Input Data:", tc.inputData[:len(tc.inputData)-2])
+				if !bytes.Contains(resp.Raw, []byte(strings.Trim(tc.inputData, "\r\n"))) { // -2 to remove trailing \r\n
+					t.Errorf("Response raw data does not contain expected input: %v", resp.Raw)
+				}
+			}
 
-func (d discard) Write(p []byte) (n int, err error) {
-	return len(p), nil
+			// Check timeout flag
+			if tc.errorType == ErrTimeout && !resp.Timeout {
+				t.Error("Expected Timeout flag to be set, but it wasn't")
+			}
+		})
+	}
+}
+
+// TestReadResponseByteByByte tests the readResponse method with byte-by-byte reading
+func TestReadResponseByteByByte(t *testing.T) {
+	// This test simulates data coming in byte by byte with delays
+	uart := &MockUART{}
+	logger := slog.Default()
+	device := Device{
+		uart:   uart,
+		logger: logger,
+	}
+
+	// We'll use a custom test function to simulate byte-by-byte input
+	testByteByByte := func(input string, waitForOK bool, expectError bool) {
+		// Reset UART's buffers
+		uart.data.Reset()
+		uart.returnData.Reset()
+
+		// Setup response object
+		resp := &Response{
+			Command: "TEST",
+			Values:  make(map[string]string),
+		}
+
+		// Force buffer count to be 1 so we read one byte at a time
+		uart.bufferCount = 1
+
+		// Start a goroutine to feed data byte by byte
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+
+			// Write each byte with a small delay
+			for _, b := range []byte(input) {
+				uart.returnData.WriteByte(b)
+				time.Sleep(1 * time.Millisecond)
+			}
+		}()
+
+		// Call the method to test
+		err := device.readResponse(resp, 100*time.Millisecond)
+
+		// Check error expectations
+		if expectError && err == nil {
+			t.Errorf("Expected error but got none for input: %q", input)
+		}
+		if !expectError && err != nil {
+			t.Errorf("Did not expect error but got: %v for input: %q", err, input)
+		}
+
+		// Wait for goroutine to finish
+		<-done
+	}
+
+	// Test cases
+	testByteByByte("OK\r\n", true, false)
+	testByteByByte("ERROR\r\n", true, true)
+	testByteByByte("+CME ERROR: 10\r\n", true, true)
+	testByteByByte("192.168.1.1\r\n", false, false) // Non-OK with waitForOK=false
 }

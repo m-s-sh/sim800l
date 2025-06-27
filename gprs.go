@@ -91,27 +91,32 @@ func (d *Device) Connect(apn, user, password string) error {
 	}
 
 	// Get local IP address - use custom mode that doesn't expect OK response
-	resp, err = d.sendWithOptions("+CIFSR", false, DefaultTimeout)
+	resp, err = d.sendWithOptions("+CIFSR", func(buffer []byte) bool {
+		// Custom check function to look for valid IP address
+		return buffer[len(buffer)-1] == '\n' && bytes.Contains(buffer, []byte("."))
+	}, DefaultTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to get IP address: %w", err)
 	}
 
-	// Parse IP address response
+	// Parse IP address response - check all lines for valid IP
 	if len(resp.Lines) > 0 {
-		// The response should contain the IP address directly
-		ip := strings.TrimSpace(resp.Lines[0])
-		if net.ParseIP(ip) != nil {
-			d.IP = ip
-			d.logger.Debug("got address", "ip", d.IP)
-		} else {
-			d.logger.Error("invalid IP address received", "ip", ip)
-			return errors.New("invalid IP address received")
+		for _, line := range resp.Lines {
+			ip := strings.TrimSpace(line)
+			if parsedIP := net.ParseIP(ip); parsedIP != nil {
+				d.IP = ip
+				d.logger.Debug("got address", "ip", d.IP)
+				// Note: There's a TinyGo compiler issue with code flow analysis
+				// that incorrectly reports "unreachable code" for the return nil
+				// statement when we use early returns. The code is actually correct.
+				return nil
+			}
 		}
-	} else {
-		return errors.New("no IP address received")
+		d.logger.Error("invalid IP address in all response lines")
+		return errors.New("invalid IP address received")
 	}
 
-	return nil
+	return errors.New("no IP address received")
 }
 
 // Disconnect closes the GPRS connection
@@ -201,7 +206,12 @@ func (d *Device) Dial(network, address string) (net.Conn, error) {
 	cmd := fmt.Sprintf("+CIPSTART=%d,\"%s\",\"%s\",\"%s\"",
 		connID, networkType, host, port)
 
-	resp, err := d.send(cmd, ConnectTimeout)
+	resp, err := d.sendWithOptions(cmd, func(buffer []byte) bool {
+		// Custom check function to look for CONNECT OK or ALREADY CONNECT
+		d.logger.Debug("checking connection response", "buffer", string(buffer))
+		return bytes.Contains(buffer, []byte("CONNECT OK")) ||
+			bytes.Contains(buffer, []byte("ALREADY CONNECT"))
+	}, ConnectTimeout)
 	if err != nil {
 		d.connections[connID] = nil
 		return nil, fmt.Errorf("connection failed: %w", err)
@@ -246,7 +256,10 @@ func (d *Device) CloseConnection(id uint8) error {
 // GetConnectionStatus returns the status of all connections
 func (d *Device) GetConnectionStatus() error {
 	// CIPSTATUS returns STATE: info and multiple +CIPSTATUS lines that we need to parse
-	resp, err := d.sendWithOptions("+CIPSTATUS", false, DefaultTimeout)
+	resp, err := d.sendWithOptions("+CIPSTATUS", func(buffer []byte) bool {
+		// Custom check function to look for +CIPSTATUS lines
+		return bytes.Contains(buffer, []byte("+CIPSTATUS:"))
+	}, DefaultTimeout)
 	if err != nil {
 		return err
 	}
@@ -301,12 +314,14 @@ func (d *Device) SendData(id uint8, data []byte) (int, error) {
 
 		// Send command to prepare for data
 		cmd := fmt.Sprintf("+CIPSEND=%d,%d", id, size)
-		resp, err := d.send(cmd, DefaultTimeout)
+		resp, err := d.sendWithOptions(cmd, func(buffer []byte) bool {
+			return bytes.Contains(buffer, []byte(">"))
+		}, DefaultTimeout)
 		if err != nil {
 			return totalSent, err
 		}
 
-		// Look for ">" prompt
+		// Look again for ">" prompt
 		if !contains(resp.Raw, []byte(">")) {
 			return totalSent, errors.New("data prompt not received")
 		}
@@ -406,7 +421,7 @@ func (d *Device) ConnectionRead(id uint8, b []byte) (int, error) {
 		copy(d.recvBuffers[id], d.recvBuffers[id][n:d.recvBufLengths[id]])
 		d.recvBufLengths[id] -= n
 	}
-
+	d.logger.Debug("read data from connection", "connID", id, "bytes", n, "b", b)
 	return n, nil
 }
 
@@ -426,7 +441,7 @@ func (d *Device) checkForReceivedData() error {
 	}
 
 	// Process the data looking for +RECEIVE notifications
-	// Format: +RECEIVE,<id>,<length>:<data>
+	// Format: +RECEIVE,<id>,<length>:\n\r<data>
 	data := string(tempBuf[:n])
 	if strings.Contains(data, "+RECEIVE") {
 		d.logger.Debug("got RECEIVE notification", "data", data)
@@ -457,7 +472,8 @@ func (d *Device) checkForReceivedData() error {
 				continue
 			}
 
-			// Get the actual data
+			// Get the actual data, we need to have in mind the \r\n at the end
+			// of the +RECEIVE notification
 			receivedData := []byte(lenDataParts[1])
 			if len(receivedData) > dataLength {
 				receivedData = receivedData[:dataLength]
@@ -480,50 +496,4 @@ func (d *Device) checkForReceivedData() error {
 	}
 
 	return nil
-}
-
-// GetIP sends AT+CIFSR command and returns the current IP address
-// This command uses the custom response handling mode since CIFSR returns
-// the IP directly without a standard OK response
-func (d *Device) GetIP() (string, error) {
-	// Use custom response mode (false) since CIFSR doesn't return OK
-	resp, err := d.sendWithOptions("+CIFSR", false, DefaultTimeout)
-	if err != nil {
-		return "", fmt.Errorf("failed to get IP address: %w", err)
-	}
-
-	// Parse the response for an IP address
-	if len(resp.Lines) > 0 {
-		for _, line := range resp.Lines {
-			ip := strings.TrimSpace(line)
-			if net.ParseIP(ip) != nil {
-				d.IP = ip // Cache the IP in the device
-				return ip, nil
-			}
-		}
-	}
-
-	return "", errors.New("no valid IP address in response")
-}
-
-// GetGPRSStatus returns the current GPRS connection state string
-// (e.g., "IP STATUS", "TCP CONNECTING", etc.)
-func (d *Device) GetGPRSStatus() (string, error) {
-	// Use custom response mode for CIPSTATUS for proper parsing
-	resp, err := d.sendWithOptions("+CIPSTATUS", false, DefaultTimeout)
-	if err != nil {
-		return "", err
-	}
-
-	// Look for STATE: line in the response
-	for _, line := range resp.Lines {
-		if strings.HasPrefix(line, "STATE:") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				return strings.TrimSpace(parts[1]), nil
-			}
-		}
-	}
-
-	return "", errors.New("state information not found in response")
 }
