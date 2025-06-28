@@ -18,25 +18,6 @@ const (
 	GPRSAttached = 1
 )
 
-// TCP/IP connection states from SIM800L
-const (
-	IPInitial     = "IP INITIAL"
-	IPStart       = "IP START"
-	IPConfig      = "IP CONFIG"
-	IPGPRSAct     = "IP GPRSACT"
-	IPStatus      = "IP STATUS"
-	TCPConnecting = "TCP CONNECTING"
-	UDPConnecting = "UDP CONNECTING"
-	ServerListen  = "SERVER LISTENING"
-	ConnectOK     = "CONNECT OK"
-	ConnectFail   = "CONNECT FAIL"
-	TCPClosing    = "TCP CLOSING"
-	UDPClosing    = "UDP CLOSING"
-	TCPClosed     = "TCP CLOSED"
-	UDPClosed     = "UDP CLOSED"
-	PDPDeact      = "PDP DEACT"
-)
-
 // Connect establishes a GPRS connection with the specified APN
 // If user and password are empty, they will not be included
 func (d *Device) Connect(apn, user, password string) error {
@@ -195,7 +176,6 @@ func (d *Device) Dial(network, address string) (net.Conn, error) {
 	}
 
 	// Store the connection
-	d.connections[connID] = conn
 
 	// Start connection
 	networkType := "TCP"
@@ -206,27 +186,35 @@ func (d *Device) Dial(network, address string) (net.Conn, error) {
 	cmd := fmt.Sprintf("+CIPSTART=%d,\"%s\",\"%s\",\"%s\"",
 		connID, networkType, host, port)
 
-	resp, err := d.sendWithOptions(cmd, func(buffer []byte) bool {
-		// Custom check function to look for CONNECT OK or ALREADY CONNECT
-		d.logger.Debug("checking connection response", "buffer", string(buffer))
-		return bytes.Contains(buffer, []byte("CONNECT OK")) ||
-			bytes.Contains(buffer, []byte("ALREADY CONNECT"))
-	}, ConnectTimeout)
+	resp, err := d.send(cmd, DefaultTimeout)
 	if err != nil {
-		d.connections[connID] = nil
+		return nil, fmt.Errorf("failed to start connection: %w", err)
+	}
+
+	resp = &Response{
+		Command: cmd,
+		checkResponse: func(buffer []byte) bool {
+			// Custom check function to look for CONNECT OK or ALREADY CONNECT
+			return bytes.Contains(buffer, []byte("CONNECT OK")) ||
+				bytes.Contains(buffer, []byte("CONNECT FAIL")) ||
+				bytes.Contains(buffer, []byte("ALREADY CONNECT"))
+		},
+	}
+
+	if err := d.readResponse(resp, ConnectTimeout); err != nil {
 		return nil, fmt.Errorf("connection failed: %w", err)
 	}
 
 	// Look for CONNECT OK in the response
 	if !resp.Success() || (!contains(resp.Raw, []byte("CONNECT OK")) &&
 		!contains(resp.Raw, []byte("ALREADY CONNECT"))) {
-		d.connections[connID] = nil
+
 		return nil, fmt.Errorf("connection failed: %s", string(resp.Raw))
 	}
 
 	// Connection successful
 	conn.State = StateConnected
-
+	d.connections[connID] = conn
 	return conn, nil
 }
 
@@ -318,12 +306,7 @@ func (d *Device) connectionSend(id uint8, data []byte) (int, error) {
 			return bytes.Contains(buffer, []byte(">"))
 		}, DefaultTimeout)
 		if err != nil {
-			return totalSent, err
-		}
-
-		// Look again for ">" prompt
-		if !contains(resp.Raw, []byte(">")) {
-			return totalSent, errors.New("data prompt not received")
+			return totalSent, fmt.Errorf("failed to send data: %w", err)
 		}
 
 		// Send data
@@ -333,26 +316,16 @@ func (d *Device) connectionSend(id uint8, data []byte) (int, error) {
 		}
 
 		// Wait for SEND OK response
-		deadline := time.Now().Add(DefaultTimeout)
-		for time.Now().Before(deadline) {
-			if d.uart.Buffered() > 0 {
-				buf := make([]byte, 256)
-				n, _ := d.uart.Read(buf)
-				if n > 0 && contains(buf[:n], []byte("SEND OK")) {
-					totalSent += size
-					break
-				}
-				if n > 0 && contains(buf[:n], []byte("SEND FAIL")) {
-					return totalSent, errors.New("send failed")
-				}
-			}
-			time.Sleep(10 * time.Millisecond)
+		resp.checkResponse = func(buffer []byte) bool {
+			// Custom check function to look for SEND OK or SEND FAIL
+			return bytes.Contains(buffer, []byte("SEND OK")) ||
+				bytes.Contains(buffer, []byte("SEND FAIL"))
+		}
+		if err := d.readResponse(resp, DefaultTimeout); err != nil {
+			return totalSent, fmt.Errorf("failed to read response: %w", err)
 		}
 
-		if !time.Now().Before(deadline) {
-			return totalSent, ErrTimeout
-		}
-
+		totalSent += size
 		// Small delay between chunks
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -421,7 +394,6 @@ func (d *Device) connectionRead(id uint8, b []byte) (int, error) {
 		copy(d.recvBuffers[id], d.recvBuffers[id][n:d.recvBufLengths[id]])
 		d.recvBufLengths[id] -= n
 	}
-	d.logger.Debug("read data from connection", "connID", id, "bytes", n, "b", b)
 	return n, nil
 }
 
@@ -441,7 +413,7 @@ func (d *Device) checkForReceivedData() error {
 	}
 
 	// Process the data looking for +RECEIVE notifications
-	// Format: +RECEIVE,<id>,<length>:\n\r<data>
+	// Format: +RECEIVE,<id>,<length>:\r\n<data>
 	data := string(tempBuf[:n])
 	if strings.Contains(data, "+RECEIVE") {
 		d.logger.Debug("got RECEIVE notification", "data", data)
@@ -458,40 +430,71 @@ func (d *Device) checkForReceivedData() error {
 			// Parse connection ID
 			id, err := strconv.Atoi(strings.TrimSpace(idLenParts[0]))
 			if err != nil || id < 0 || id >= MaxConnections || d.connections[id] == nil {
+				d.logger.Debug("invalid connection ID", "id", idLenParts[0], "error", err)
 				continue
 			}
 
 			// Parse data length and extract data
 			lenDataParts := strings.SplitN(idLenParts[1], ":", 2)
 			if len(lenDataParts) < 2 {
+				d.logger.Debug("missing data after length", "part", idLenParts[1])
 				continue
 			}
 
-			dataLength, err := strconv.Atoi(strings.TrimSpace(lenDataParts[0]))
+			dataLengthStr := strings.TrimSpace(lenDataParts[0])
+			dataLength, err := strconv.Atoi(dataLengthStr)
 			if err != nil || dataLength <= 0 {
+				d.logger.Debug("invalid data length", "length", dataLengthStr, "error", err)
 				continue
 			}
 
-			// Get the actual data, we need to have in mind the \r\n at the end
-			// of the +RECEIVE notification
-			receivedData := []byte(lenDataParts[1])
-			if len(receivedData) > dataLength {
-				receivedData = receivedData[:dataLength]
+			// The raw data after the colon contains a \r\n sequence before the actual data
+			rawData := lenDataParts[1]
+
+			// Format is "+RECEIVE,<id>,<length>:\r\n<data>"
+			// Find the \r\n after the colon and skip it to get to the actual data
+			dataStartIndex := 0
+			if len(rawData) >= 2 && rawData[0] == '\r' && rawData[1] == '\n' {
+				// Skip the \r\n sequence
+				dataStartIndex = 2
 			}
 
-			// Add to receive buffer
-			availSpace := len(d.recvBuffers[id]) - d.recvBufLengths[id]
-			if availSpace <= 0 {
-				// Buffer full, log warning
-				d.logger.Warn("receive buffer full, dropping data", "connID", id)
-				continue
+			d.logger.Debug("parsing received data",
+				"id", id,
+				"expectedLength", dataLength,
+				"rawDataLen", len(rawData),
+				"dataStartIndex", dataStartIndex)
+
+			// Extract the actual data, respecting the specified length
+			if dataStartIndex+dataLength > len(rawData) {
+				// Not enough data received yet, use what we have
+				receivedData := []byte(rawData[dataStartIndex:])
+				d.logger.Debug("incomplete data received",
+					"expected", dataLength,
+					"got", len(receivedData),
+					"rawData", rawData)
+			} else {
+				// We have enough data, extract exactly dataLength bytes
+				receivedData := []byte(rawData[dataStartIndex : dataStartIndex+dataLength])
+
+				// Add to receive buffer
+				availSpace := len(d.recvBuffers[id]) - d.recvBufLengths[id]
+				if availSpace <= 0 {
+					// Buffer full, log warning
+					d.logger.Warn("receive buffer full, dropping data", "connID", id)
+					continue
+				}
+
+				copyLen := min(len(receivedData), availSpace)
+				copy(d.recvBuffers[id][d.recvBufLengths[id]:], receivedData[:copyLen])
+				d.recvBufLengths[id] += copyLen
+
+				d.logger.Debug("data added to buffer",
+					"connID", id,
+					"bytes", copyLen,
+					"dataLength", dataLength,
+					"data", string(receivedData[:copyLen]))
 			}
-
-			copyLen := min(len(receivedData), availSpace)
-			copy(d.recvBuffers[id][d.recvBufLengths[id]:], receivedData[:copyLen])
-			d.recvBufLengths[id] += copyLen
-
-			d.logger.Debug("data added to buffer", "connID", id, "bytes", copyLen)
 		}
 	}
 
