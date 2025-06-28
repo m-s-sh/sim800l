@@ -290,8 +290,8 @@ func (d *Device) GetConnectionStatus() error {
 	return nil
 }
 
-// SendData sends data through a connection
-func (d *Device) SendData(id uint8, data []byte) (int, error) {
+// connectionSend sends data through a connection
+func (d *Device) connectionSend(id uint8, data []byte) (int, error) {
 	if id >= MaxConnections || d.connections[id] == nil {
 		return 0, fmt.Errorf("invalid connection ID: %d", id)
 	}
@@ -387,9 +387,9 @@ func (d *Device) CheckNetworkRegistration() (bool, error) {
 	return false, errors.New("could not parse registration status")
 }
 
-// ConnectionRead implements reading data from a specific connection
+// connectionRead implements reading data from a specific connection
 // Used internally by the Connection's Read method
-func (d *Device) ConnectionRead(id uint8, b []byte) (int, error) {
+func (d *Device) connectionRead(id uint8, b []byte) (int, error) {
 	// Check if the connection exists
 	if id >= MaxConnections || d.connections[id] == nil {
 		return 0, errors.New("invalid connection")
