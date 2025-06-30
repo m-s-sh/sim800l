@@ -12,25 +12,19 @@ import (
 	"time"
 )
 
-// GPRS connection states
-const (
-	GPRSDetached = 0
-	GPRSAttached = 1
-)
-
 // Connect establishes a GPRS connection with the specified APN
 // If user and password are empty, they will not be included
 func (d *Device) Connect(apn, user, password string) error {
 
 	// Check if module is attached to GPRS service
-	resp, err := d.send("+CGATT?", DefaultTimeout)
+	err := d.send("+CGATT?", DefaultTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to check GPRS attachment: %w", err)
 	}
 
 	// Parse attachment status
 	attached := false
-	if val, ok := resp.Values["+CGATT"]; ok {
+	if val, ok := d.parseValue("+CGATT"); ok {
 		if val == "1" {
 			attached = true
 		}
@@ -39,7 +33,7 @@ func (d *Device) Connect(apn, user, password string) error {
 	// If not attached, attach to GPRS service
 	if !attached {
 		d.logger.Info("not attached to GPRS, attaching now...")
-		_, err = d.send("+CGATT=1", ConnectTimeout)
+		err = d.send("+CGATT=1", ConnectTimeout)
 		if err != nil {
 			d.logger.Error("failed to attach to GPRS", "error", err)
 			return fmt.Errorf("failed to attach to GPRS: %w", err)
@@ -47,7 +41,7 @@ func (d *Device) Connect(apn, user, password string) error {
 	}
 
 	// Enable multi-connection mode
-	_, err = d.send("+CIPMUX=1", DefaultTimeout)
+	err = d.send("+CIPMUX=1", DefaultTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to enable multi-connection: %w", err)
 	}
@@ -60,19 +54,19 @@ func (d *Device) Connect(apn, user, password string) error {
 		cmd = fmt.Sprintf("+CSTT=\"%s\"", apn)
 	}
 
-	_, err = d.send(cmd, DefaultTimeout)
+	err = d.send(cmd, DefaultTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to set APN: %w", err)
 	}
 
 	// Start wireless connection
-	_, err = d.send("+CIICR", ConnectTimeout)
+	err = d.send("+CIICR", ConnectTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to bring up wireless connection: %w", err)
 	}
 
 	// Get local IP address - use custom mode that doesn't expect OK response
-	resp, err = d.sendWithOptions("+CIFSR", func(buffer []byte) bool {
+	err = d.sendWithOptions("+CIFSR", func(buffer []byte) bool {
 		// Custom check function to look for valid IP address
 		return buffer[len(buffer)-1] == '\n' && bytes.Contains(buffer, []byte("."))
 	}, DefaultTimeout)
@@ -81,23 +75,12 @@ func (d *Device) Connect(apn, user, password string) error {
 	}
 
 	// Parse IP address response - check all lines for valid IP
-	if len(resp.Lines) > 0 {
-		for _, line := range resp.Lines {
-			ip := strings.TrimSpace(line)
-			if parsedIP := net.ParseIP(ip); parsedIP != nil {
-				d.IP = ip
-				d.logger.Debug("got address", "ip", d.IP)
-				// Note: There's a TinyGo compiler issue with code flow analysis
-				// that incorrectly reports "unreachable code" for the return nil
-				// statement when we use early returns. The code is actually correct.
-				return nil
-			}
-		}
+	ip := strings.TrimSpace(string(d.buffer[:d.end]))
+	if net.ParseIP(ip) == nil {
 		d.logger.Error("invalid IP address in all response lines")
-		return errors.New("invalid IP address received")
 	}
-
-	return errors.New("no IP address received")
+	d.IP = ip
+	return nil
 }
 
 // Disconnect closes the GPRS connection
@@ -110,13 +93,13 @@ func (d *Device) Disconnect() error {
 	}
 
 	// Shut down PDP context
-	_, err := d.send("+CIPSHUT", DefaultTimeout)
+	err := d.send("+CIPSHUT", DefaultTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to shut down PDP context: %w", err)
 	}
 
 	// Detach from GPRS service
-	_, err = d.send("+CGATT=0", DefaultTimeout)
+	err = d.send("+CGATT=0", DefaultTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to detach from GPRS: %w", err)
 	}
@@ -186,30 +169,22 @@ func (d *Device) Dial(network, address string) (net.Conn, error) {
 	cmd := fmt.Sprintf("+CIPSTART=%d,\"%s\",\"%s\",\"%s\"",
 		connID, networkType, host, port)
 
-	resp, err := d.send(cmd, DefaultTimeout)
+	err = d.send(cmd, DefaultTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start connection: %w", err)
 	}
 
-	resp = &Response{
-		Command: cmd,
-		checkResponse: func(buffer []byte) bool {
-			// Custom check function to look for CONNECT OK or ALREADY CONNECT
-			return bytes.Contains(buffer, []byte("CONNECT OK")) ||
-				bytes.Contains(buffer, []byte("CONNECT FAIL")) ||
-				bytes.Contains(buffer, []byte("ALREADY CONNECT"))
-		},
-	}
-
-	if err := d.readResponse(resp, ConnectTimeout); err != nil {
+	if err := d.readResponse("", func(buffer []byte) bool {
+		// Custom check function to look for CONNECT OK or ALREADY CONNECT
+		return bytes.Contains(buffer, []byte("CONNECT OK")) ||
+			bytes.Contains(buffer, []byte("CONNECT FAIL")) ||
+			bytes.Contains(buffer, []byte("ALREADY CONNECT"))
+	}, ConnectTimeout); err != nil {
 		return nil, fmt.Errorf("connection failed: %w", err)
 	}
 
-	// Look for CONNECT OK in the response
-	if !resp.Success() || (!contains(resp.Raw, []byte("CONNECT OK")) &&
-		!contains(resp.Raw, []byte("ALREADY CONNECT"))) {
-
-		return nil, fmt.Errorf("connection failed: %s", string(resp.Raw))
+	if !bytes.Contains(d.buffer, []byte("CONNECT OK")) && !bytes.Contains(d.buffer, []byte("ALREADY CONNECT")) {
+		return nil, fmt.Errorf("connection failed: %s", string(d.buffer))
 	}
 
 	// Connection successful
@@ -229,7 +204,7 @@ func (d *Device) CloseConnection(id uint8) error {
 
 	// Send close command
 	cmd := fmt.Sprintf("+CIPCLOSE=%d", id)
-	_, err := d.send(cmd, DefaultTimeout)
+	err := d.send(cmd, DefaultTimeout)
 
 	// Even if there was an error, mark the connection as closed
 	d.connections[id] = nil
@@ -244,7 +219,7 @@ func (d *Device) CloseConnection(id uint8) error {
 // GetConnectionStatus returns the status of all connections
 func (d *Device) GetConnectionStatus() error {
 	// CIPSTATUS returns STATE: info and multiple +CIPSTATUS lines that we need to parse
-	resp, err := d.sendWithOptions("+CIPSTATUS", func(buffer []byte) bool {
+	err := d.sendWithOptions("+CIPSTATUS", func(buffer []byte) bool {
 		// Custom check function to look for +CIPSTATUS lines
 		return bytes.Contains(buffer, []byte("+CIPSTATUS:"))
 	}, DefaultTimeout)
@@ -253,27 +228,27 @@ func (d *Device) GetConnectionStatus() error {
 	}
 
 	// Parse connection status
-	for _, line := range resp.Lines {
-		if strings.HasPrefix(line, "+CIPSTATUS:") {
-			parts := strings.Split(line[11:], ",")
-			if len(parts) >= 4 {
-				// Parse connection ID
-				id, err := strconv.Atoi(strings.TrimSpace(parts[0]))
-				if err == nil && id >= 0 && id < MaxConnections {
-					// If we have this connection, update its state
-					if d.connections[id] != nil {
-						switch strings.Trim(parts[1], "\"") {
-						case "TCP", "UDP":
-							d.connections[id].State = StateConnected
-						case "CLOSED":
-							d.connections[id].State = StateClosed
-							d.connections[id] = nil
-						}
-					}
-				}
-			}
-		}
-	}
+	// for _, line := range resp.Lines {
+	// 	if strings.HasPrefix(line, "+CIPSTATUS:") {
+	// 		parts := strings.Split(line[11:], ",")
+	// 		if len(parts) >= 4 {
+	// 			// Parse connection ID
+	// 			id, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	// 			if err == nil && id >= 0 && id < MaxConnections {
+	// 				// If we have this connection, update its state
+	// 				if d.connections[id] != nil {
+	// 					switch strings.Trim(parts[1], "\"") {
+	// 					case "TCP", "UDP":
+	// 						d.connections[id].State = StateConnected
+	// 					case "CLOSED":
+	// 						d.connections[id].State = StateClosed
+	// 						d.connections[id] = nil
+	// 					}
+	// 				}
+	// 			}
+	// 		}
+	// 	}
+	// }
 
 	return nil
 }
@@ -302,7 +277,7 @@ func (d *Device) connectionSend(id uint8, data []byte) (int, error) {
 
 		// Send command to prepare for data
 		cmd := fmt.Sprintf("+CIPSEND=%d,%d", id, size)
-		resp, err := d.sendWithOptions(cmd, func(buffer []byte) bool {
+		err := d.sendWithOptions(cmd, func(buffer []byte) bool {
 			return bytes.Contains(buffer, []byte(">"))
 		}, DefaultTimeout)
 		if err != nil {
@@ -316,12 +291,11 @@ func (d *Device) connectionSend(id uint8, data []byte) (int, error) {
 		}
 
 		// Wait for SEND OK response
-		resp.checkResponse = func(buffer []byte) bool {
+		if err := d.readResponse("", func(buffer []byte) bool {
 			// Custom check function to look for SEND OK or SEND FAIL
 			return bytes.Contains(buffer, []byte("SEND OK")) ||
 				bytes.Contains(buffer, []byte("SEND FAIL"))
-		}
-		if err := d.readResponse(resp, DefaultTimeout); err != nil {
+		}, DefaultTimeout); err != nil {
 			return totalSent, fmt.Errorf("failed to read response: %w", err)
 		}
 
@@ -340,25 +314,25 @@ func contains(b, a []byte) bool {
 }
 
 // CheckNetworkRegistration verifies the network registration status
-func (d *Device) CheckNetworkRegistration() (bool, error) {
-	resp, err := d.send("+CREG?", DefaultTimeout)
-	if err != nil {
-		return false, err
-	}
+// func (d *Device) CheckNetworkRegistration() (bool, error) {
+// 	err := d.send("+CREG?", DefaultTimeout)
+// 	if err != nil {
+// 		return false, err
+// 	}
 
-	// Parse registration status
-	// +CREG: 0,1 means registered to home network
-	// +CREG: 0,5 means registered to roaming network
-	if val, ok := resp.Values["+CREG"]; ok {
-		parts := strings.Split(val, ",")
-		if len(parts) >= 2 {
-			status := strings.TrimSpace(parts[1])
-			return status == "1" || status == "5", nil
-		}
-	}
+// 	// Parse registration status
+// 	// +CREG: 0,1 means registered to home network
+// 	// +CREG: 0,5 means registered to roaming network
+// 	if val, ok := resp.Values["+CREG"]; ok {
+// 		parts := strings.Split(val, ",")
+// 		if len(parts) >= 2 {
+// 			status := strings.TrimSpace(parts[1])
+// 			return status == "1" || status == "5", nil
+// 		}
+// 	}
 
-	return false, errors.New("could not parse registration status")
-}
+// 	return false, errors.New("could not parse registration status")
+// }
 
 // connectionRead implements reading data from a specific connection
 // Used internally by the Connection's Read method
@@ -391,7 +365,7 @@ func (d *Device) connectionRead(id uint8, b []byte) (int, error) {
 		d.recvBufLengths[id] = 0
 	} else {
 		// Otherwise, shift remaining data to the beginning of the buffer
-		copy(d.recvBuffers[id], d.recvBuffers[id][n:d.recvBufLengths[id]])
+		copy(d.recvBuffers[id][:], d.recvBuffers[id][n:d.recvBufLengths[id]])
 		d.recvBufLengths[id] -= n
 	}
 	return n, nil
@@ -405,9 +379,9 @@ func (d *Device) checkForReceivedData() error {
 		return nil
 	}
 
-	// Check for data notifications in the UART buffer
-	tempBuf := make([]byte, 256)
-	n, err := d.uart.Read(tempBuf)
+	// Check for data notifications in the UART buffer using fixed array
+	var tempBuf [256]byte
+	n, err := d.uart.Read(tempBuf[:])
 	if err != nil || n == 0 {
 		return err
 	}
@@ -468,14 +442,14 @@ func (d *Device) checkForReceivedData() error {
 			// Extract the actual data, respecting the specified length
 			if dataStartIndex+dataLength > len(rawData) {
 				// Not enough data received yet, use what we have
-				receivedData := []byte(rawData[dataStartIndex:])
 				d.logger.Debug("incomplete data received",
 					"expected", dataLength,
-					"got", len(receivedData),
+					"got", len(rawData)-dataStartIndex,
 					"rawData", rawData)
-			} else {
-				// We have enough data, extract exactly dataLength bytes
-				receivedData := []byte(rawData[dataStartIndex : dataStartIndex+dataLength])
+
+				// Create a fixed-size buffer and copy data into it
+				var tempReceivedData [256]byte
+				receivedLen := copy(tempReceivedData[:], rawData[dataStartIndex:])
 
 				// Add to receive buffer
 				availSpace := len(d.recvBuffers[id]) - d.recvBufLengths[id]
@@ -485,15 +459,37 @@ func (d *Device) checkForReceivedData() error {
 					continue
 				}
 
-				copyLen := min(len(receivedData), availSpace)
-				copy(d.recvBuffers[id][d.recvBufLengths[id]:], receivedData[:copyLen])
+				copyLen := min(receivedLen, availSpace)
+				copy(d.recvBuffers[id][d.recvBufLengths[id]:], tempReceivedData[:copyLen])
+				d.recvBufLengths[id] += copyLen
+
+				d.logger.Debug("incomplete data added to buffer",
+					"connID", id,
+					"bytes", copyLen,
+					"dataLength", dataLength,
+					"data", string(tempReceivedData[:copyLen]))
+			} else {
+				// We have enough data, extract exactly dataLength bytes
+				var tempReceivedData [256]byte
+				receivedLen := copy(tempReceivedData[:], rawData[dataStartIndex:dataStartIndex+dataLength])
+
+				// Add to receive buffer
+				availSpace := len(d.recvBuffers[id]) - d.recvBufLengths[id]
+				if availSpace <= 0 {
+					// Buffer full, log warning
+					d.logger.Warn("receive buffer full, dropping data", "connID", id)
+					continue
+				}
+
+				copyLen := min(receivedLen, availSpace)
+				copy(d.recvBuffers[id][d.recvBufLengths[id]:], tempReceivedData[:copyLen])
 				d.recvBufLengths[id] += copyLen
 
 				d.logger.Debug("data added to buffer",
 					"connID", id,
 					"bytes", copyLen,
 					"dataLength", dataLength,
-					"data", string(receivedData[:copyLen]))
+					"data", string(tempReceivedData[:copyLen]))
 			}
 		}
 	}

@@ -61,7 +61,7 @@ func (h *MockHandler) WithGroup(name string) slog.Handler {
 func TestCheckForReceivedData(t *testing.T) {
 	d := Device{
 		uart: &MockUART{
-			returnData: *bytes.NewBuffer([]byte("+RECEIVE,0,4:\r\n\x02\x00\x00\r\n")),
+			returnData: bytes.NewBuffer([]byte("+RECEIVE,0,4:\r\n\x02\x00\x00\r\n")),
 		},
 		logger:      slog.New(&MockHandler{t: t}),
 		connections: [5]*Connection{},

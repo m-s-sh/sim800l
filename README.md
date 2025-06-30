@@ -63,10 +63,36 @@ if err != nil {
 }
 ```
 
+## Memory Optimization for TinyGo
+
+This driver is specifically optimized for TinyGo and constrained environments:
+
+- Uses fixed-size arrays instead of dynamic slices for all buffers
+- Minimizes memory allocations during operation
+- Efficient buffer management for UART communication
+- Static allocation of response buffers and data structures
+
 ## Custom Response Handling
 
-Some AT commands like `AT+CIFSR` (get IP address) don't return standard `OK`/`ERROR` responses. 
-Instead, they return the result directly. This driver handles these special cases using a custom response mode.
+The driver supports custom response handling via callback functions:
+
+```go
+// Define a custom response check function
+// This example looks for a specific text pattern in the response
+customCheck := func(buffer []byte) bool {
+    return bytes.Contains(buffer, []byte("MY_EXPECTED_RESPONSE"))
+}
+
+// Send a command with the custom check function
+resp, err := device.SendWithCustomCheck("+MYCMD", customCheck, sim800l.DefaultTimeout)
+```
+
+This is particularly useful for:
+- Commands that don't return standard OK/ERROR responses
+- Waiting for specific URC (Unsolicited Result Code) messages
+- Custom protocols implemented over AT commands
+
+See the `/examples/custom_check` directory for a complete example.
 
 ### Example Usage
 
