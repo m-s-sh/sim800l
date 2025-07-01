@@ -345,7 +345,7 @@ func (d *Device) connectionRead(id uint8, b []byte) (int, error) {
 	// Check if there's data available in the buffer
 	if d.recvBufLengths[id] == 0 {
 		// Try to check for new data from the device
-		err := d.checkForReceivedData()
+		err := d.checkForReceivedData(DefaultTimeout)
 		if err != nil {
 			// Non-blocking, just log the error
 			d.logger.Debug("Error checking for data", "error", err)
@@ -373,126 +373,116 @@ func (d *Device) connectionRead(id uint8, b []byte) (int, error) {
 
 // checkForReceivedData checks for any new data received on any connection
 // This should be called periodically to process pending data notifications
-func (d *Device) checkForReceivedData() error {
-	// If no data is available, return immediately
-	if d.uart.Buffered() == 0 {
-		return nil
-	}
+func (d *Device) checkForReceivedData(timeout time.Duration) error {
+	// If no data is available initially, wait for some data to arrive within timeout
+	st := time.Now()
+	var state int        // 0 - waiting for +RECEIVE, 1 - reading data
+	var length int       // length of data to read
+	cid := -1            // connection ID
+	end := 0             // end index in the buffer
+	var buffer [256]byte // buffer to read data into
 
-	// Check for data notifications in the UART buffer using fixed array
-	var tempBuf [256]byte
-	n, err := d.uart.Read(tempBuf[:])
-	if err != nil || n == 0 {
-		return err
-	}
-
-	// Process the data looking for +RECEIVE notifications
-	// Format: +RECEIVE,<id>,<length>:\r\n<data>
-	data := string(tempBuf[:n])
-	if strings.Contains(data, "+RECEIVE") {
-		d.logger.Debug("got RECEIVE notification", "data", data)
-
-		// Parse the notification to extract connection ID, length, and data
-		parts := strings.Split(data, "+RECEIVE,")
-		for _, part := range parts[1:] { // Skip the first part (before first +RECEIVE)
-			// Extract connection ID and length
-			idLenParts := strings.Split(part, ",")
-			if len(idLenParts) < 2 {
-				continue
-			}
-
-			// Parse connection ID
-			id, err := strconv.Atoi(strings.TrimSpace(idLenParts[0]))
-			if err != nil || id < 0 || id >= MaxConnections || d.connections[id] == nil {
-				d.logger.Debug("invalid connection ID", "id", idLenParts[0], "error", err)
-				continue
-			}
-
-			// Parse data length and extract data
-			lenDataParts := strings.SplitN(idLenParts[1], ":", 2)
-			if len(lenDataParts) < 2 {
-				d.logger.Debug("missing data after length", "part", idLenParts[1])
-				continue
-			}
-
-			dataLengthStr := strings.TrimSpace(lenDataParts[0])
-			dataLength, err := strconv.Atoi(dataLengthStr)
-			if err != nil || dataLength <= 0 {
-				d.logger.Debug("invalid data length", "length", dataLengthStr, "error", err)
-				continue
-			}
-
-			// The raw data after the colon contains a \r\n sequence before the actual data
-			rawData := lenDataParts[1]
-
-			// Format is "+RECEIVE,<id>,<length>:\r\n<data>"
-			// Find the \r\n after the colon and skip it to get to the actual data
-			dataStartIndex := 0
-			if len(rawData) >= 2 && rawData[0] == '\r' && rawData[1] == '\n' {
-				// Skip the \r\n sequence
-				dataStartIndex = 2
-			}
-
-			d.logger.Debug("parsing received data",
-				"id", id,
-				"expectedLength", dataLength,
-				"rawDataLen", len(rawData),
-				"dataStartIndex", dataStartIndex)
-
-			// Extract the actual data, respecting the specified length
-			if dataStartIndex+dataLength > len(rawData) {
-				// Not enough data received yet, use what we have
-				d.logger.Debug("incomplete data received",
-					"expected", dataLength,
-					"got", len(rawData)-dataStartIndex,
-					"rawData", rawData)
-
-				// Create a fixed-size buffer and copy data into it
-				var tempReceivedData [256]byte
-				receivedLen := copy(tempReceivedData[:], rawData[dataStartIndex:])
-
-				// Add to receive buffer
-				availSpace := len(d.recvBuffers[id]) - d.recvBufLengths[id]
-				if availSpace <= 0 {
-					// Buffer full, log warning
-					d.logger.Warn("receive buffer full, dropping data", "connID", id)
-					continue
+	for time.Since(st) < timeout {
+		n, err := d.uart.Read(buffer[end:])
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			time.Sleep(10 * time.Millisecond) // no data, wait a bit
+			continue
+		}
+		end += n
+		d.logger.Debug("read data from UART", "bytes", n, "buffer", buffer[:end])
+		switch state {
+		case 0:
+			i := bytes.Index(buffer[:end], []byte("+RECEIVE"))
+			if i != -1 {
+				// find first '\r\n' after '+RECEIVE'
+				j := bytes.Index(buffer[i:end], []byte(":"))
+				if j == -1 {
+					continue // not found, continue reading
+				}
+				// extract connection id and length
+				// +RECEIVE, => i+9
+				// :\r\n => j+1
+				st := strings.Split(string(buffer[i+9:j+i]), ",")
+				if len(st) < 2 {
+					continue // not enough parts, continue reading
 				}
 
-				copyLen := min(receivedLen, availSpace)
-				copy(d.recvBuffers[id][d.recvBufLengths[id]:], tempReceivedData[:copyLen])
-				d.recvBufLengths[id] += copyLen
+				// Parse the connection ID from the string
+				cid, err = strconv.Atoi(strings.TrimSpace(st[0]))
+				if err != nil || cid < 0 || cid >= MaxConnections || d.connections[cid] == nil {
+					d.logger.Debug("invalid connection ID in RECEIVE", "id", st[0])
+					continue // invalid connection ID, continue reading
+				}
+				length, err = strconv.Atoi(string(st[1]))
+				if err != nil {
+					continue // invalid length, continue reading
+				}
 
-				d.logger.Debug("incomplete data added to buffer",
-					"connID", id,
-					"bytes", copyLen,
-					"dataLength", dataLength,
-					"data", string(tempReceivedData[:copyLen]))
+				// read data if we have data in buffer
+				dataStart := bytes.Index(buffer[j:end], []byte("\r\n"))
+				if dataStart == -1 {
+					continue // not enough data, continue reading
+				}
+				dataStart += j + 2 // skip \r\n
+				dataEnd := dataStart + length
+				// Extract data from buffer and store in connection buffer
+				dataAvailable := dataEnd - dataStart
+				// Check if there's enough space in the connection buffer
+				if d.recvBufLengths[cid]+dataAvailable > len(d.recvBuffers[cid]) {
+					// Buffer would overflow, only copy what fits
+					spaceLeft := len(d.recvBuffers[cid]) - d.recvBufLengths[cid]
+					if spaceLeft > 0 {
+						copy(d.recvBuffers[cid][d.recvBufLengths[cid]:], buffer[dataStart:dataStart+spaceLeft])
+						d.recvBufLengths[cid] += spaceLeft
+					}
+					d.logger.Warn("receive buffer overflow", "connection", cid, "data_lost", dataAvailable-spaceLeft)
+				} else {
+					// Copy data to connection buffer
+					copy(d.recvBuffers[cid][d.recvBufLengths[cid]:], buffer[dataStart:dataEnd])
+					d.recvBufLengths[cid] += dataAvailable
+				}
+
+				d.logger.Debug("received data for connection", "id", cid, "length", d.recvBufLengths[cid])
+				if length == d.recvBufLengths[cid] {
+					// We have enough data, return success
+					return nil
+				}
+				clear(buffer[:end]) // clear buffer
+				end = 0             // reset end index
+				state = 1           // switch to reading data state
+			}
+		case 1:
+			// we are in reading data state, check if we have enough data
+			// Copy data to connection buffer
+			// Check if there's enough space in the connection buffer
+			if d.recvBufLengths[cid]+end > len(d.recvBuffers[cid]) {
+				// Buffer would overflow, only copy what fits
+				spaceLeft := len(d.recvBuffers[cid]) - d.recvBufLengths[cid]
+				if spaceLeft > 0 {
+					copy(d.recvBuffers[cid][d.recvBufLengths[cid]:], buffer[:spaceLeft])
+					d.recvBufLengths[cid] += spaceLeft
+				}
+				d.logger.Warn("receive buffer overflow", "connection", cid, "data_lost", end-spaceLeft)
 			} else {
-				// We have enough data, extract exactly dataLength bytes
-				var tempReceivedData [256]byte
-				receivedLen := copy(tempReceivedData[:], rawData[dataStartIndex:dataStartIndex+dataLength])
+				// Copy all data to connection buffer
+				copy(d.recvBuffers[cid][d.recvBufLengths[cid]:], buffer[:end])
+				d.recvBufLengths[cid] += end
+			}
 
-				// Add to receive buffer
-				availSpace := len(d.recvBuffers[id]) - d.recvBufLengths[id]
-				if availSpace <= 0 {
-					// Buffer full, log warning
-					d.logger.Warn("receive buffer full, dropping data", "connID", id)
-					continue
-				}
+			clear(buffer[:end]) // clear buffer
+			end = 0             // reset end index
 
-				copyLen := min(receivedLen, availSpace)
-				copy(d.recvBuffers[id][d.recvBufLengths[id]:], tempReceivedData[:copyLen])
-				d.recvBufLengths[id] += copyLen
-
-				d.logger.Debug("data added to buffer",
-					"connID", id,
-					"bytes", copyLen,
-					"dataLength", dataLength,
-					"data", string(tempReceivedData[:copyLen]))
+			// Check if we have enough data
+			if d.recvBufLengths[cid] >= length {
+				// We have enough data, return success
+				return nil
 			}
 		}
 	}
 
-	return nil
+	// No RECEIVE notification found within timeout - not an error, just no data
+	return ErrTimeout
 }
