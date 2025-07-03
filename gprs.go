@@ -183,8 +183,8 @@ func (d *Device) Dial(network, address string) (net.Conn, error) {
 		return nil, fmt.Errorf("connection failed: %w", err)
 	}
 
-	if !bytes.Contains(d.buffer, []byte("CONNECT OK")) && !bytes.Contains(d.buffer, []byte("ALREADY CONNECT")) {
-		return nil, fmt.Errorf("connection failed: %s", string(d.buffer))
+	if bytes.Contains(d.buffer[:], []byte("CONNECT FAIL")) {
+		return nil, fmt.Errorf("connection failed")
 	}
 
 	// Connection successful
@@ -392,7 +392,7 @@ func (d *Device) checkForReceivedData(timeout time.Duration) error {
 			continue
 		}
 		end += n
-		d.logger.Debug("read data from UART", "bytes", n, "buffer", buffer[:end])
+		//d.logger.Debug("read data from UART", "bytes", n, "buffer", buffer[:end])
 		switch state {
 		case 0:
 			i := bytes.Index(buffer[:end], []byte("+RECEIVE"))

@@ -88,7 +88,7 @@ type Device struct {
 	logger      *slog.Logger                // Logger for debug output
 	connections [MaxConnections]*Connection // Active connections
 	IP          string                      // Current IP address
-	buffer      []byte                      // Fixed buffer for UART operations
+	buffer      [256]byte                   // Fixed buffer for UART operations
 	end         int                         // Current end index in the buffer
 	powerState  bool                        // Current power state
 	IMEI        string                      // Module IMEI
@@ -105,7 +105,6 @@ func New(uart drivers.UART, resetPin machine.Pin, logger *slog.Logger) *Device {
 		uart:     uart,
 		resetPin: resetPin,
 		logger:   logger,
-		buffer:   make([]byte, 256), // Fixed buffer for UART operations
 	}
 
 	// Initialize connection state
