@@ -106,8 +106,6 @@ func TestReadResponse(t *testing.T) {
 				},
 				logger: slog.New(&MockHandler{t: t}),
 			}
-			// Initialize the buffer
-			d.buffer = make([]byte, 1024)
 
 			err := d.readResponse(tc.expectCommand, nil, DefaultTimeout)
 			if err != nil {

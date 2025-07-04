@@ -219,7 +219,7 @@ func (d *Device) sendWithOptions(cmd string, checkFunc ResponseCheckFunc, timeou
 	// Read and parse the response
 	err = d.readResponse(cmd, checkFunc, timeout)
 	if err != nil {
-		d.logger.Debug("command error", slog.String("command", cmd), slog.String("error", err.Error()))
+		d.logger.Debug("command error", slog.Any("command", cmd), "ERROR", err)
 		return err
 	}
 
@@ -256,7 +256,7 @@ func (d *Device) readResponse(cmd string, checkResponse ResponseCheckFunc, timeo
 			if bytes.Contains(b, []byte(ErrorText)) {
 				rerr = &ATError{
 					Command: cmd,
-					Message: ErrorText,
+					//Message: ErrorText,
 				}
 				break
 			}
@@ -266,14 +266,17 @@ func (d *Device) readResponse(cmd string, checkResponse ResponseCheckFunc, timeo
 
 		}
 
-		// Check for CME/CMS errors (like "+CME ERROR: 10")
+		//Check for CME/CMS errors (like "+CME ERROR: 10")
 		if d.end > 12 && (bytes.Contains(b, []byte("+CME ERROR:")) ||
 			bytes.Contains(b, []byte("+CMS ERROR:"))) {
 			msg := parseErrorMessage(b)
 			rerr = &ATError{
 				Command: cmd,
-				Message: msg,
 			}
+			d.logger.Error("command error",
+				slog.String("command", cmd),
+				slog.String("error", msg),
+			)
 			break
 		}
 	}
@@ -381,13 +384,12 @@ func (d *Device) parseValue(k string) (value string, ok bool) {
 // ATError represents an error returned by an AT command
 type ATError struct {
 	Command string // The AT command that caused the error
-	Message string // The error message
 }
 
 // Error returns the error message, implementing the error interface
 func (e *ATError) Error() string {
-	if e.Message == "" {
+	if len(e.Command) == 0 {
 		return "AT command error"
 	}
-	return fmt.Sprintf("AT command error: %s [command: %s]", e.Message, e.Command)
+	return fmt.Sprintf("%s command error", e.Command)
 }

@@ -234,7 +234,7 @@ func (d *Device) GetConnectionStatus() error {
 	// 		if len(parts) >= 4 {
 	// 			// Parse connection ID
 	// 			id, err := strconv.Atoi(strings.TrimSpace(parts[0]))
-	// 			if err == nil && id >= 0 && id < MaxConnections {
+	// 			if err == nil && id >= 0 && id < MaxConnections {""
 	// 				// If we have this connection, update its state
 	// 				if d.connections[id] != nil {
 	// 					switch strings.Trim(parts[1], "\"") {
@@ -303,7 +303,6 @@ func (d *Device) connectionSend(id uint8, data []byte) (int, error) {
 		// Small delay between chunks
 		time.Sleep(100 * time.Millisecond)
 	}
-
 	return totalSent, nil
 }
 
@@ -336,6 +335,7 @@ func contains(b, a []byte) bool {
 
 // connectionRead implements reading data from a specific connection
 // Used internally by the Connection's Read method
+
 func (d *Device) connectionRead(id uint8, b []byte) (int, error) {
 	// Check if the connection exists
 	if id >= MaxConnections || d.connections[id] == nil {
@@ -346,9 +346,11 @@ func (d *Device) connectionRead(id uint8, b []byte) (int, error) {
 	if d.recvBufLengths[id] == 0 {
 		// Try to check for new data from the device
 		err := d.checkForReceivedData(DefaultTimeout)
-		if err != nil {
+		if err != nil && err != ErrTimeout {
 			// Non-blocking, just log the error
-			d.logger.Debug("Error checking for data", "error", err)
+			if d.logger != nil {
+				d.logger.Debug("error checking for data", "error", err)
+			}
 		}
 
 		// If still no data, return would-block error
@@ -368,12 +370,17 @@ func (d *Device) connectionRead(id uint8, b []byte) (int, error) {
 		copy(d.recvBuffers[id][:], d.recvBuffers[id][n:d.recvBufLengths[id]])
 		d.recvBufLengths[id] -= n
 	}
+
 	return n, nil
 }
 
 // checkForReceivedData checks for any new data received on any connection
 // This should be called periodically to process pending data notifications
-func (d *Device) checkForReceivedData(timeout time.Duration) error {
+func (d *Device) checkForReceivedData(timeout time.Duration) error { // Check if UART is initialized to prevent nil pointer dereference
+	if d.uart == nil {
+		return errors.New("uart not initialized")
+	}
+
 	// If no data is available initially, wait for some data to arrive within timeout
 	st := time.Now()
 	var state int        // 0 - waiting for +RECEIVE, 1 - reading data
@@ -430,6 +437,13 @@ func (d *Device) checkForReceivedData(timeout time.Duration) error {
 				dataEnd := dataStart + length
 				// Extract data from buffer and store in connection buffer
 				dataAvailable := dataEnd - dataStart
+				// No need to check for nil since we're using fixed-size arrays
+				// But we should ensure the index is valid
+				if cid < 0 || cid >= len(d.recvBuffers) {
+					// Skip this data if the connection ID is invalid
+					continue
+				}
+
 				// Check if there's enough space in the connection buffer
 				if d.recvBufLengths[cid]+dataAvailable > len(d.recvBuffers[cid]) {
 					// Buffer would overflow, only copy what fits
@@ -438,14 +452,18 @@ func (d *Device) checkForReceivedData(timeout time.Duration) error {
 						copy(d.recvBuffers[cid][d.recvBufLengths[cid]:], buffer[dataStart:dataStart+spaceLeft])
 						d.recvBufLengths[cid] += spaceLeft
 					}
-					d.logger.Warn("receive buffer overflow", "connection", cid, "data_lost", dataAvailable-spaceLeft)
+
+					// Safety check for nil logger
+					if d.logger != nil {
+						d.logger.Warn("receive buffer overflow", "connection", cid, "data_lost", dataAvailable-spaceLeft)
+					}
 				} else {
 					// Copy data to connection buffer
 					copy(d.recvBuffers[cid][d.recvBufLengths[cid]:], buffer[dataStart:dataEnd])
 					d.recvBufLengths[cid] += dataAvailable
 				}
 
-				d.logger.Debug("received data for connection", "id", cid, "length", d.recvBufLengths[cid])
+				//d.logger.Debug("received data for connection", "id", cid, "length", d.recvBufLengths[cid])
 				if length == d.recvBufLengths[cid] {
 					// We have enough data, return success
 					return nil
@@ -465,7 +483,9 @@ func (d *Device) checkForReceivedData(timeout time.Duration) error {
 					copy(d.recvBuffers[cid][d.recvBufLengths[cid]:], buffer[:spaceLeft])
 					d.recvBufLengths[cid] += spaceLeft
 				}
-				d.logger.Warn("receive buffer overflow", "connection", cid, "data_lost", end-spaceLeft)
+				if d.logger != nil {
+					d.logger.Warn("receive buffer overflow", "connection", cid, "data_lost", end-spaceLeft)
+				}
 			} else {
 				// Copy all data to connection buffer
 				copy(d.recvBuffers[cid][d.recvBufLengths[cid]:], buffer[:end])
