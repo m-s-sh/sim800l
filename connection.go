@@ -9,6 +9,12 @@ import (
 	"time"
 )
 
+var (
+	ErrInvalidConnection        = errors.New("invalid connection")
+	ErrConnectionNotEstablished = errors.New("connection not established")
+	ErrConnectionClosed         = errors.New("connection closed")
+)
+
 // Connection represents a single connection to a remote server
 // Connection already defined in sim800l.go
 
@@ -17,7 +23,7 @@ import (
 func (c *Connection) Read(b []byte) (int, error) {
 	// Check if connection is valid
 	if c == nil || c.Device == nil {
-		return 0, errors.New("invalid connection")
+		return 0, ErrInvalidConnection
 	}
 
 	// Check connection state
@@ -34,12 +40,12 @@ func (c *Connection) Read(b []byte) (int, error) {
 func (c *Connection) Write(b []byte) (int, error) {
 	// Check if connection is valid
 	if c == nil || c.Device == nil {
-		return 0, errors.New("invalid connection")
+		return 0, ErrInvalidConnection
 	}
 
 	// Check connection state
 	if c.State != StateConnected {
-		return 0, errors.New("connection not established")
+		return 0, ErrConnectionNotEstablished
 	}
 
 	// Use the module's SendData function
@@ -51,7 +57,7 @@ func (c *Connection) Write(b []byte) (int, error) {
 func (c *Connection) Close() error {
 	// Check if connection is valid
 	if c == nil || c.Device == nil {
-		return errors.New("invalid connection")
+		return ErrInvalidConnection
 	}
 
 	// Use the module's CloseConnection function

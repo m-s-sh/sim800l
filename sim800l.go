@@ -27,8 +27,8 @@ const (
 
 // Common error types
 var (
-	ErrTimeout       = errors.New("AT command timeout")
 	ErrError         = errors.New("AT command error")
+	ErrTimeout       = errors.New("command timed out")
 	ErrNotConnected  = errors.New("not connected to network")
 	ErrNoIP          = errors.New("no IP address")
 	ErrBadParameter  = errors.New("invalid parameter")
@@ -264,7 +264,7 @@ func (d *Device) readResponse(cmd string, checkResponse ResponseCheckFunc, timeo
 		//Check for CME/CMS errors (like "+CME ERROR: 10")
 		if d.end > 12 && (bytes.Contains(b, []byte("+CME ERROR:")) ||
 			bytes.Contains(b, []byte("+CMS ERROR:"))) {
-			msg := parseErrorMessage(b)
+			msg := string(d.buffer[:d.end])
 			rerr = &ATError{
 				Command: cmd,
 			}
@@ -288,21 +288,13 @@ func (d *Device) readResponse(cmd string, checkResponse ResponseCheckFunc, timeo
 // parseErrorMessage extracts the error message from response containing CME/CMS errors
 func parseErrorMessage(data []byte) string {
 	s := string(data)
-	if idx := strings.Index(s, "+CME ERROR:"); idx >= 0 {
-		errMsg := s[idx:]
-		if eol := strings.Index(errMsg, "\r\n"); eol > 0 {
-			return strings.TrimSpace(errMsg[:eol])
-		}
-		return strings.TrimSpace(errMsg)
+	idx := strings.Index(s, ":")
+	if idx < 0 {
+		return s // No colon found, return the whole string
 	}
-	if idx := strings.Index(s, "+CMS ERROR:"); idx >= 0 {
-		errMsg := s[idx:]
-		if eol := strings.Index(errMsg, "\r\n"); eol > 0 {
-			return strings.TrimSpace(errMsg[:eol])
-		}
-		return strings.TrimSpace(errMsg)
-	}
-	return ErrorText
+	// Extract the part after the colon
+	s = strings.TrimSpace(s[idx+1:])
+	return s
 }
 
 // clearBuffer clears any data in the UART buffer
