@@ -12,6 +12,10 @@ import (
 	"time"
 )
 
+var (
+	ErrWouldBlock = errors.New("would block")
+)
+
 // Connect establishes a GPRS connection with the specified APN
 // If user and password are empty, they will not be included
 func (d *Device) Connect(apn, user, password string) error {
@@ -339,7 +343,7 @@ func contains(b, a []byte) bool {
 func (d *Device) connectionRead(id uint8, b []byte) (int, error) {
 	// Check if the connection exists
 	if id >= MaxConnections || d.connections[id] == nil {
-		return 0, errors.New("invalid connection")
+		return 0, ErrInvalidConnection
 	}
 
 	// Check if there's data available in the buffer
@@ -348,14 +352,12 @@ func (d *Device) connectionRead(id uint8, b []byte) (int, error) {
 		err := d.checkForReceivedData(DefaultTimeout)
 		if err != nil && err != ErrTimeout {
 			// Non-blocking, just log the error
-			if d.logger != nil {
-				d.logger.Debug("error checking for data", "error", err)
-			}
+			d.logger.Debug("error checking for data", "error", err)
 		}
 
 		// If still no data, return would-block error
 		if d.recvBufLengths[id] == 0 {
-			return 0, errors.New("would block")
+			return 0, ErrWouldBlock
 		}
 	}
 
@@ -376,133 +378,157 @@ func (d *Device) connectionRead(id uint8, b []byte) (int, error) {
 
 // checkForReceivedData checks for any new data received on any connection
 // This should be called periodically to process pending data notifications
-func (d *Device) checkForReceivedData(timeout time.Duration) error { // Check if UART is initialized to prevent nil pointer dereference
-	if d.uart == nil {
-		return errors.New("uart not initialized")
-	}
+func (d *Device) checkForReceivedData(timeout time.Duration) error {
+	startTime := time.Now()
+	var buffer [256]byte // Fixed buffer size
+	end := 0
 
-	// If no data is available initially, wait for some data to arrive within timeout
-	st := time.Now()
-	var state int        // 0 - waiting for +RECEIVE, 1 - reading data
-	var length int       // length of data to read
-	cid := -1            // connection ID
-	end := 0             // end index in the buffer
-	var buffer [256]byte // buffer to read data into
+	// State machine variables
+	state := 0      // 0=looking for +RECEIVE, 1=reading data
+	cid := -1       // Current connection ID
+	dataLength := 0 // Expected data length
 
-	for time.Since(st) < timeout {
+	for time.Since(startTime) < timeout {
+		// Read available data into buffer
 		n, err := d.uart.Read(buffer[end:])
 		if err != nil {
 			return err
 		}
+
 		if n == 0 {
-			time.Sleep(10 * time.Millisecond) // no data, wait a bit
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
+
 		end += n
-		//d.logger.Debug("read data from UART", "bytes", n, "buffer", buffer[:end])
+
+		// Handle buffer overflow
+		if end >= len(buffer) {
+			d.logger.Warn("buffer overflow, resetting")
+			end = 0
+			state = 0
+			continue
+		}
+
+		// Process buffer based on current state
 		switch state {
-		case 0:
-			i := bytes.Index(buffer[:end], []byte("+RECEIVE"))
-			if i != -1 {
-				// find first '\r\n' after '+RECEIVE'
-				j := bytes.Index(buffer[i:end], []byte(":"))
-				if j == -1 {
-					continue // not found, continue reading
-				}
-				// extract connection id and length
-				// +RECEIVE, => i+9
-				// :\r\n => j+1
-				st := strings.Split(string(buffer[i+9:j+i]), ",")
-				if len(st) < 2 {
-					continue // not enough parts, continue reading
-				}
+		case 0: // Looking for +RECEIVE notification
+			// Try to find +RECEIVE
+			if idx := bytes.Index(buffer[:end], []byte("+RECEIVE")); idx >= 0 {
+				// Find colon after +RECEIVE
+				if colonIdx := bytes.Index(buffer[idx:end], []byte(":")); colonIdx >= 0 {
+					colonIdx += idx // Adjust to full buffer position
 
-				// Parse the connection ID from the string
-				cid, err = strconv.Atoi(strings.TrimSpace(st[0]))
-				if err != nil || cid < 0 || cid >= MaxConnections || d.connections[cid] == nil {
-					d.logger.Debug("invalid connection ID in RECEIVE", "id", st[0])
-					continue // invalid connection ID, continue reading
-				}
-				length, err = strconv.Atoi(string(st[1]))
-				if err != nil {
-					continue // invalid length, continue reading
-				}
+					// Extract connection ID and length
+					paramStr := string(buffer[idx+9 : colonIdx]) // +RECEIVE, = 9 chars
+					params := strings.Split(paramStr, ",")
+					if len(params) >= 2 {
+						var parseErr error
+						cid, parseErr = strconv.Atoi(strings.TrimSpace(params[0]))
+						if parseErr != nil || cid < 0 || cid >= MaxConnections ||
+							d.connections[cid] == nil {
+							d.logger.Debug("invalid connection ID", "id", params[0])
+							// Reset buffer and continue looking
+							copy(buffer[:], buffer[colonIdx+1:end])
+							end -= (colonIdx + 1)
+							continue
+						}
 
-				// read data if we have data in buffer
-				dataStart := bytes.Index(buffer[j:end], []byte("\r\n"))
-				if dataStart == -1 {
-					continue // not enough data, continue reading
-				}
-				dataStart += j + 2 // skip \r\n
-				dataEnd := dataStart + length
-				// Extract data from buffer and store in connection buffer
-				dataAvailable := dataEnd - dataStart
-				// No need to check for nil since we're using fixed-size arrays
-				// But we should ensure the index is valid
-				if cid < 0 || cid >= len(d.recvBuffers) {
-					// Skip this data if the connection ID is invalid
-					continue
-				}
+						dataLength, parseErr = strconv.Atoi(strings.TrimSpace(params[1]))
+						if parseErr != nil {
+							// Reset buffer and continue looking
+							copy(buffer[:], buffer[colonIdx+1:end])
+							end -= (colonIdx + 1)
+							continue
+						}
 
-				// Check if there's enough space in the connection buffer
-				if d.recvBufLengths[cid]+dataAvailable > len(d.recvBuffers[cid]) {
-					// Buffer would overflow, only copy what fits
-					spaceLeft := len(d.recvBuffers[cid]) - d.recvBufLengths[cid]
-					if spaceLeft > 0 {
-						copy(d.recvBuffers[cid][d.recvBufLengths[cid]:], buffer[dataStart:dataStart+spaceLeft])
-						d.recvBufLengths[cid] += spaceLeft
+						// Find the data start (after \r\n)
+						if crlfIdx := bytes.Index(buffer[colonIdx:end], []byte("\r\n")); crlfIdx >= 0 {
+							dataStartIdx := colonIdx + crlfIdx + 2 // +2 for \r\n
+
+							// Check how much data we already have
+							dataAvailable := end - dataStartIdx
+							dataToProcess := min(dataAvailable, dataLength)
+
+							// Copy available data to connection buffer
+							if dataToProcess > 0 {
+								// Check for buffer space
+								if d.recvBufLengths[cid]+dataToProcess > len(d.recvBuffers[cid]) {
+									// Not enough space, copy what fits
+									spaceLeft := len(d.recvBuffers[cid]) - d.recvBufLengths[cid]
+									if spaceLeft > 0 {
+										copy(d.recvBuffers[cid][d.recvBufLengths[cid]:],
+											buffer[dataStartIdx:dataStartIdx+spaceLeft])
+										d.recvBufLengths[cid] += spaceLeft
+									}
+									d.logger.Warn("receive buffer overflow",
+										"connection", cid,
+										"data_lost", dataToProcess-spaceLeft)
+								} else {
+									// Enough space, copy all data
+									copy(d.recvBuffers[cid][d.recvBufLengths[cid]:],
+										buffer[dataStartIdx:dataStartIdx+dataToProcess])
+									d.recvBufLengths[cid] += dataToProcess
+								}
+							}
+
+							// If we got all data, return success
+							if d.recvBufLengths[cid] >= dataLength {
+								return nil
+							}
+
+							// Otherwise, prepare for reading more data
+							state = 1
+							end = 0
+						}
 					}
-
-					// Safety check for nil logger
-					if d.logger != nil {
-						d.logger.Warn("receive buffer overflow", "connection", cid, "data_lost", dataAvailable-spaceLeft)
-					}
-				} else {
-					// Copy data to connection buffer
-					copy(d.recvBuffers[cid][d.recvBufLengths[cid]:], buffer[dataStart:dataEnd])
-					d.recvBufLengths[cid] += dataAvailable
 				}
-
-				//d.logger.Debug("received data for connection", "id", cid, "length", d.recvBufLengths[cid])
-				if length == d.recvBufLengths[cid] {
-					// We have enough data, return success
-					return nil
-				}
-				clear(buffer[:end]) // clear buffer
-				end = 0             // reset end index
-				state = 1           // switch to reading data state
 			}
-		case 1:
-			// we are in reading data state, check if we have enough data
-			// Copy data to connection buffer
-			// Check if there's enough space in the connection buffer
-			if d.recvBufLengths[cid]+end > len(d.recvBuffers[cid]) {
-				// Buffer would overflow, only copy what fits
+
+		case 1: // Reading data directly
+			// How much more data we need
+			remaining := dataLength - d.recvBufLengths[cid]
+			if remaining <= 0 {
+				return nil // We have all the data
+			}
+
+			// Process available data
+			dataToRead := min(end, remaining)
+
+			// Check for buffer space
+			if d.recvBufLengths[cid]+dataToRead > len(d.recvBuffers[cid]) {
+				// Not enough space, copy what fits
 				spaceLeft := len(d.recvBuffers[cid]) - d.recvBufLengths[cid]
 				if spaceLeft > 0 {
-					copy(d.recvBuffers[cid][d.recvBufLengths[cid]:], buffer[:spaceLeft])
+					copy(d.recvBuffers[cid][d.recvBufLengths[cid]:],
+						buffer[:spaceLeft])
 					d.recvBufLengths[cid] += spaceLeft
 				}
-				if d.logger != nil {
-					d.logger.Warn("receive buffer overflow", "connection", cid, "data_lost", end-spaceLeft)
-				}
+				d.logger.Warn("receive buffer overflow",
+					"connection", cid,
+					"data_lost", dataToRead-spaceLeft)
 			} else {
-				// Copy all data to connection buffer
-				copy(d.recvBuffers[cid][d.recvBufLengths[cid]:], buffer[:end])
-				d.recvBufLengths[cid] += end
+				// Enough space, copy all data
+				copy(d.recvBuffers[cid][d.recvBufLengths[cid]:],
+					buffer[:dataToRead])
+				d.recvBufLengths[cid] += dataToRead
 			}
 
-			clear(buffer[:end]) // clear buffer
-			end = 0             // reset end index
+			// Move any remaining data to start of buffer
+			remaining = end - dataToRead
+			if remaining > 0 {
+				copy(buffer[:], buffer[dataToRead:end])
+				end = remaining
+			} else {
+				end = 0
+			}
 
-			// Check if we have enough data
-			if d.recvBufLengths[cid] >= length {
-				// We have enough data, return success
+			// Check if we have all the data now
+			if d.recvBufLengths[cid] >= dataLength {
 				return nil
 			}
 		}
 	}
 
-	// No RECEIVE notification found within timeout - not an error, just no data
 	return ErrTimeout
 }

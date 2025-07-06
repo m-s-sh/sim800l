@@ -64,6 +64,7 @@ func TestCheckForReceivedData(t *testing.T) {
 	tests := []struct {
 		name           string
 		inputData      []byte
+		data           []byte
 		connectionID   uint8
 		expectedLength int
 		expectError    bool
@@ -71,7 +72,8 @@ func TestCheckForReceivedData(t *testing.T) {
 	}{
 		{
 			name:           "Basic data receive",
-			inputData:      []byte("+RECEIVE,0,4:\r\n\x02\x00\x00\r"),
+			inputData:      []byte("+RECEIVE,0,4:\r\n\x02\x00\x00\x00"),
+			data:           []byte("\x02\x00\x00\x00"),
 			connectionID:   0,
 			expectedLength: 4,
 			expectError:    false,
@@ -80,22 +82,25 @@ func TestCheckForReceivedData(t *testing.T) {
 		{
 			name:           "Two-part receive notification",
 			inputData:      []byte("+RECEIVE,1,10:\r\nHelloWorld"),
+			data:           []byte("HelloWorld"),
 			connectionID:   1,
 			expectedLength: 10,
 			expectError:    false,
 			setupBuffers:   true,
 		},
 		{
-			name:           "Begin receive notification",
-			inputData:      []byte("\r\n\r\n+RECEIVE,1,300:\r\nHTTP/1.1 400 Bad Request\r\nDate: Mon, 30 Jun 2025 15:23:54 GMT\r\nDate: Mon, 30 Jun 2025 15:23:54 GMT\r\nContent-Type: text/html\r\nContent-Length: 154\r\nConnection: close\r\nServer: tcpbin\r\n\r\n<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>openresty</center>\r\n</body>\r\n</html>\r\n"),
+			name:           "Receive notification with large data",
+			inputData:      []byte("\r\n\r\n+RECEIVE,1,335:\r\nHTTP/1.1 400 Bad Request\r\nDate: Mon, 30 Jun 2025 15:23:54 GMT\r\nDate: Mon, 30 Jun 2025 15:23:54 GMT\r\nContent-Type: text/html\r\nContent-Length: 154\r\nConnection: close\r\nServer: tcpbin\r\n\r\n<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>openresty</center>\r\n</body>\r\n</html>\r\n"),
+			data:           []byte("HTTP/1.1 400 Bad Request\r\nDate: Mon, 30 Jun 2025 15:23:54 GMT\r\nDate: Mon, 30 Jun 2025 15:23:54 GMT\r\nContent-Type: text/html\r\nContent-Length: 154\r\nConnection: close\r\nServer: tcpbin\r\n\r\n<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>openresty</center>\r\n</body>\r\n</html>"),
 			connectionID:   1,
-			expectedLength: 300,
+			expectedLength: 335,
 			expectError:    false,
 			setupBuffers:   true,
 		},
 		{
 			name:         "Invalid connection ID",
 			inputData:    []byte("+RECEIVE,7,5:\r\ntest\r\n"),
+			data:         []byte("test"),
 			connectionID: 7, // Invalid ID (out of range)
 			expectError:  true,
 			setupBuffers: false,
@@ -103,13 +108,14 @@ func TestCheckForReceivedData(t *testing.T) {
 		{
 			name:         "No connection at ID",
 			inputData:    []byte("+RECEIVE,2,5:\r\ntest\r\n"),
+			data:         []byte("test"),
 			connectionID: 2, // Valid ID but no connection setup
 			expectError:  true,
 			setupBuffers: false,
 		},
 		{
 			name:           "Large data packet",
-			inputData:      append([]byte("+RECEIVE,0,128:\r\n"), bytes.Repeat([]byte("X"), 128)...),
+			inputData:      append([]byte("+RECEIVE,0,128:\r\n"), bytes.Repeat([]byte("X"), 1024)...),
 			connectionID:   0,
 			expectedLength: 128,
 			expectError:    false,
@@ -162,10 +168,25 @@ func TestCheckForReceivedData(t *testing.T) {
 					// For example, verify the first few bytes match expected data
 					if tc.expectedLength > 0 && d.recvBufLengths[tc.connectionID] > 0 {
 						t.Logf("Received data (first few bytes): %v",
-							d.recvBuffers[tc.connectionID][:min(5, d.recvBufLengths[tc.connectionID])])
+							string(d.recvBuffers[tc.connectionID][:min(5, d.recvBufLengths[tc.connectionID])]))
+						if tc.data != nil {
+							if !compare(t, d.recvBuffers[tc.connectionID][:d.recvBufLengths[tc.connectionID]], tc.data, tc.expectedLength) {
+								t.Logf("Received data does not match expected data")
+							}
+						}
 					}
 				}
 			}
 		})
 	}
+}
+
+func compare(t *testing.T, a, b []byte, size int) bool {
+	for i := 0; i < size; i++ {
+		if a[i] != b[i] {
+			t.Logf("Bytes differ at index %d: %v != %v", i, a[i], b[i])
+			return false
+		}
+	}
+	return true
 }
