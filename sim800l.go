@@ -7,12 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"machine"
 	"strconv"
 	"strings"
 	"time"
-
-	"tinygo.org/x/drivers"
 )
 
 // Constants for the SIM800L module
@@ -83,8 +80,8 @@ type Connection struct {
 
 // Device represents the SIM800L device itself
 type Device struct {
-	uart        drivers.UART                // UART interface for communication
-	resetPin    machine.Pin                 // Pin for hardware reset
+	uart        UART                        // UART interface for communication
+	resetPin    Pin                         // Pin for hardware reset
 	logger      *slog.Logger                // Logger for debug output
 	connections [MaxConnections]*Connection // Active connections
 	IP          string                      // Current IP address
@@ -99,8 +96,9 @@ type Device struct {
 	recvBufLengths [MaxConnections]int               // Length of data in each buffer
 }
 
-// New creates a new SIM800L device instance
-func New(uart drivers.UART, resetPin machine.Pin, logger *slog.Logger) *Device {
+// New creates a new SIM800L device instance.
+// For now we accept that resetPin is always configured as output.
+func New(uart UART, resetPin Pin, logger *slog.Logger) *Device {
 	d := &Device{
 		uart:     uart,
 		resetPin: resetPin,
@@ -117,9 +115,6 @@ func New(uart drivers.UART, resetPin machine.Pin, logger *slog.Logger) *Device {
 
 // Init initializes the SIM800L device
 func (d *Device) Init() error {
-	// Configure pins
-	d.resetPin.Configure(machine.PinConfig{Mode: machine.PinOutput})
-
 	// Perform hardware reset
 	err := d.HardReset()
 	if err != nil {

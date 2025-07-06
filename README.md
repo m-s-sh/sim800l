@@ -2,6 +2,8 @@
 
 This package implements a driver for the SIM800L GSM/GPRS module optimized for TinyGo running on constrained environments like the Raspberry Pi Pico.
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/m-s-sh/sim800l.svg)](https://pkg.go.dev/github.com/m-s-sh/sim800l)
+
 ## Comments
 It is experiment in it's roots, of using CoPilot, so will be interesting to see the result. Not all code and text is will fully tested.  
 _(this paragraph was written by human, about the rest not 100% sure)._

@@ -5,6 +5,8 @@ import (
 	"context"
 	"log/slog"
 	"testing"
+
+	"github.com/m-s-sh/mockhw"
 )
 
 type MockHandler struct {
@@ -116,11 +118,11 @@ func TestCheckForReceivedData(t *testing.T) {
 	}
 
 	for _, tc := range tests {
+		uart := mockhw.NewUART(1000) // 1 second max delay
+		uart.SetRxBuffer(tc.inputData)
 		t.Run(tc.name, func(t *testing.T) {
 			d := Device{
-				uart: &MockUART{
-					returnData: bytes.NewBuffer(tc.inputData),
-				},
+				uart:           uart,
 				logger:         slog.New(&MockHandler{t: t}),
 				connections:    [MaxConnections]*Connection{},
 				recvBuffers:    [MaxConnections][1024]byte{},

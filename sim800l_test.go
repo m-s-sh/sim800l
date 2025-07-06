@@ -6,49 +6,11 @@
 package sim800l
 
 import (
-	"bytes"
-	"errors"
 	"log/slog"
 	"testing"
+
+	"github.com/m-s-sh/mockhw"
 )
-
-// MockUART implements drivers.UART for testing
-type MockUART struct {
-	data        *bytes.Buffer
-	returnData  *bytes.Buffer
-	bufferCount int
-}
-
-func (m *MockUART) Buffered() int {
-	// If we have a specific buffer count set, use that
-	if m.bufferCount > 0 {
-		return m.bufferCount
-	}
-	return m.returnData.Len()
-}
-
-func (m *MockUART) ReadByte() (byte, error) {
-	if m.returnData.Len() == 0 {
-		return 0, errors.New("no data")
-	}
-	return m.returnData.ReadByte()
-}
-
-func (m *MockUART) Write(data []byte) (n int, err error) {
-	return m.data.Write(data)
-}
-
-func (m *MockUART) Read(data []byte) (n int, err error) {
-	return m.returnData.Read(data)
-}
-
-func (m *MockUART) Flush() error {
-	return nil
-}
-
-func (m *MockUART) SetBaudRate(br uint32) error {
-	return nil
-}
 
 // MockPin implements machine.Pin for testing
 type MockPin struct {
@@ -99,11 +61,10 @@ func TestReadResponse(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := bytes.NewBuffer(tc.responseData)
+			uart := mockhw.NewUART(1000) // 1 second max delay
+			uart.SetRxBuffer(tc.responseData)
 			d := Device{
-				uart: &MockUART{
-					returnData: buf,
-				},
+				uart:   uart,
 				logger: slog.New(&MockHandler{t: t}),
 			}
 

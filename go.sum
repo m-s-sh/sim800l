@@ -1,4 +1,4 @@
-github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 h1:El6M4kTTCOh6aBiKaUGG7oYTSPP8MxqL4YI3kZKwcP4=
-github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510/go.mod h1:pupxD2MaaD3pAXIBCelhxNneeOaAeabZDe5s4K6zSpQ=
-tinygo.org/x/drivers v0.32.0 h1:qz7MRR1ZBIUhWC6kc4XuVNPr2+mUT8m7QJwA+Jji4IU=
-tinygo.org/x/drivers v0.32.0/go.mod h1:ZdErNrApSABdVXjA1RejD67R8SNRI6RKVfYgQDZtKtk=
+github.com/m-s-sh/mockhw v0.0.0-20250706094054-c4d5cfd4ce85 h1:jBYPnZP5F4Wxp0/rsN7oLkwKqmFy58kUsarkleEIwVs=
+github.com/m-s-sh/mockhw v0.0.0-20250706094054-c4d5cfd4ce85/go.mod h1:y5WNteFBd+pzWxP0b5mj70GjxlebXJ/sdVtSzcGlgwk=
+github.com/m-s-sh/mockhw v0.0.2 h1:9Eq/lP2DwKMiVzkWibyd6gcBmmN2miPNuPIB6SM5qqw=
+github.com/m-s-sh/mockhw v0.0.2/go.mod h1:y5WNteFBd+pzWxP0b5mj70GjxlebXJ/sdVtSzcGlgwk=
