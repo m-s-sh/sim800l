@@ -13,7 +13,9 @@ import (
 )
 
 var (
-	ErrWouldBlock = errors.New("would block")
+	ErrWouldBlock    = errors.New("would block")
+	ErrCannotSend    = errors.New("cannot send data")
+	ErrCannotConnect = errors.New("cannot connect to remote host")
 )
 
 // Connect establishes a GPRS connection with the specified APN
@@ -21,7 +23,7 @@ var (
 func (d *Device) Connect(apn, user, password string) error {
 
 	// Check if module is attached to GPRS service
-	err := d.send("+CGATT?", DefaultTimeout)
+	err := d.send("+CGATT?")
 	if err != nil {
 		return fmt.Errorf("failed to check GPRS attachment: %w", err)
 	}
@@ -37,7 +39,7 @@ func (d *Device) Connect(apn, user, password string) error {
 	// If not attached, attach to GPRS service
 	if !attached {
 		d.logger.Info("not attached to GPRS, attaching now...")
-		err = d.send("+CGATT=1", ConnectTimeout)
+		err = d.send("+CGATT=1")
 		if err != nil {
 			d.logger.Error("failed to attach to GPRS", "error", err)
 			return fmt.Errorf("failed to attach to GPRS: %w", err)
@@ -45,7 +47,7 @@ func (d *Device) Connect(apn, user, password string) error {
 	}
 
 	// Enable multi-connection mode
-	err = d.send("+CIPMUX=1", DefaultTimeout)
+	err = d.send("+CIPMUX=1")
 	if err != nil {
 		return fmt.Errorf("failed to enable multi-connection: %w", err)
 	}
@@ -58,21 +60,27 @@ func (d *Device) Connect(apn, user, password string) error {
 		cmd = fmt.Sprintf("+CSTT=\"%s\"", apn)
 	}
 
-	err = d.send(cmd, DefaultTimeout)
+	err = d.send(cmd)
 	if err != nil {
 		return fmt.Errorf("failed to set APN: %w", err)
 	}
 
 	// Start wireless connection
-	err = d.send("+CIICR", ConnectTimeout)
+	err = d.send("+CIICR")
 	if err != nil {
 		return fmt.Errorf("failed to bring up wireless connection: %w", err)
 	}
 
 	// Get local IP address - use custom mode that doesn't expect OK response
-	err = d.sendWithOptions("+CIFSR", func(buffer []byte) bool {
+	err = d.sendWithOptions("+CIFSR", func(buffer []byte) error {
 		// Custom check function to look for valid IP address
-		return buffer[len(buffer)-1] == '\n' && bytes.Contains(buffer, []byte("."))
+		if buffer[len(buffer)-1] != '\n' {
+			return fmt.Errorf("invalid response format")
+		}
+		if !bytes.Contains(buffer, []byte(".")) {
+			return fmt.Errorf("no valid IP address found")
+		}
+		return nil
 	}, DefaultTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to get IP address: %w", err)
@@ -97,13 +105,13 @@ func (d *Device) Disconnect() error {
 	}
 
 	// Shut down PDP context
-	err := d.send("+CIPSHUT", DefaultTimeout)
+	err := d.send("+CIPSHUT")
 	if err != nil {
 		return fmt.Errorf("failed to shut down PDP context: %w", err)
 	}
 
 	// Detach from GPRS service
-	err = d.send("+CGATT=0", DefaultTimeout)
+	err = d.send("+CGATT=0")
 	if err != nil {
 		return fmt.Errorf("failed to detach from GPRS: %w", err)
 	}
@@ -123,15 +131,15 @@ func (d *Device) Dial(network, address string) (net.Conn, error) {
 	}
 
 	// Find available connection slot
-	connID := -1
+	cid := -1
 	for i := 0; i < MaxConnections; i++ {
 		if d.connections[i] == nil {
-			connID = i
+			cid = i
 			break
 		}
 	}
 
-	if connID == -1 {
+	if cid == -1 {
 		return nil, ErrMaxConn
 	}
 
@@ -154,7 +162,7 @@ func (d *Device) Dial(network, address string) (net.Conn, error) {
 
 	// Create connection object
 	conn := &Connection{
-		ID:         uint8(connID),
+		ID:         uint8(cid),
 		Type:       connType,
 		State:      StateConnecting,
 		RemoteIP:   host,
@@ -171,91 +179,94 @@ func (d *Device) Dial(network, address string) (net.Conn, error) {
 	}
 
 	cmd := fmt.Sprintf("+CIPSTART=%d,\"%s\",\"%s\",\"%s\"",
-		connID, networkType, host, port)
+		cid, networkType, host, port)
 
-	err = d.send(cmd, DefaultTimeout)
+	err = d.send(cmd)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start connection: %w", err)
 	}
 
-	if err := d.readResponse("", func(buffer []byte) bool {
+	if err := d.readResponse("+CIPSTART", func(buffer []byte) error {
 		// Custom check function to look for CONNECT OK or ALREADY CONNECT
-		return bytes.Contains(buffer, []byte("CONNECT OK")) ||
-			bytes.Contains(buffer, []byte("CONNECT FAIL")) ||
-			bytes.Contains(buffer, []byte("ALREADY CONNECT"))
+		if bytes.Contains(buffer, []byte("CONNECT OK")) {
+			return nil
+		}
+		if bytes.Contains(buffer, []byte("CONNECT FAIL")) {
+			return ErrCannotConnect
+		}
+		if bytes.Contains(buffer, []byte("ALREADY CONNECT")) {
+			return nil
+		}
+		return ErrUnexpectedResponse
 	}, ConnectTimeout); err != nil {
 		return nil, fmt.Errorf("connection failed: %w", err)
 	}
 
-	if bytes.Contains(d.buffer[:], []byte("CONNECT FAIL")) {
-		return nil, fmt.Errorf("connection failed")
-	}
-
 	// Connection successful
 	conn.State = StateConnected
-	d.connections[connID] = conn
+	d.connections[cid] = conn
 	return conn, nil
 }
 
 // CloseConnection closes a specific connection by ID
-func (d *Device) CloseConnection(id uint8) error {
-	if id >= MaxConnections || d.connections[id] == nil {
-		return fmt.Errorf("invalid connection ID: %d", id)
+func (d *Device) CloseConnection(cid uint8) error {
+	if cid >= MaxConnections || d.connections[cid] == nil {
+		return fmt.Errorf("invalid connection ID: %d", cid)
 	}
 
-	conn := d.connections[id]
+	conn := d.connections[cid]
 	conn.State = StateClosing
 
 	// Send close command
-	cmd := fmt.Sprintf("+CIPCLOSE=%d", id)
-	err := d.send(cmd, DefaultTimeout)
+	cmd := fmt.Sprintf("+CIPCLOSE=%d", cid)
+	err := d.send(cmd)
 
 	// Even if there was an error, mark the connection as closed
-	d.connections[id] = nil
+	d.connections[cid] = nil
 
 	if err != nil {
-		return fmt.Errorf("failed to close connection %d: %w", id, err)
+		return fmt.Errorf("failed to close connection %d: %w", cid, err)
 	}
 
 	return nil
 }
 
-// GetConnectionStatus returns the status of all connections
-func (d *Device) GetConnectionStatus() error {
-	// CIPSTATUS returns STATE: info and multiple +CIPSTATUS lines that we need to parse
-	err := d.sendWithOptions("+CIPSTATUS", func(buffer []byte) bool {
-		// Custom check function to look for +CIPSTATUS lines
-		return bytes.Contains(buffer, []byte("+CIPSTATUS:"))
-	}, DefaultTimeout)
-	if err != nil {
-		return err
-	}
+// // GetConnectionStatus returns the status of all connections
+// func (d *Device) GetConnectionStatus() error {
+// 	// CIPSTATUS returns STATE: info and multiple +CIPSTATUS lines that we need to parse
+// 	err := d.sendWithOptions("+CIPSTATUS", func(buffer []byte) bool {
+// 		// Custom check function to look for +CIPSTATUS lines
+// 		return bytes.Contains(buffer, []byte("+CIPSTATUS:"))
+// 	}, DefaultTimeout)
+// 	if err != nil {
+// 		return err
+// 	}
 
-	// Parse connection status
-	// for _, line := range resp.Lines {
-	// 	if strings.HasPrefix(line, "+CIPSTATUS:") {
-	// 		parts := strings.Split(line[11:], ",")
-	// 		if len(parts) >= 4 {
-	// 			// Parse connection ID
-	// 			id, err := strconv.Atoi(strings.TrimSpace(parts[0]))
-	// 			if err == nil && id >= 0 && id < MaxConnections {""
-	// 				// If we have this connection, update its state
-	// 				if d.connections[id] != nil {
-	// 					switch strings.Trim(parts[1], "\"") {
-	// 					case "TCP", "UDP":
-	// 						d.connections[id].State = StateConnected
-	// 					case "CLOSED":
-	// 						d.connections[id].State = StateClosed
-	// 						d.connections[id] = nil
-	// 					}
-	// 				}
-	// 			}
-	// 		}
-	// 	}
-	// }
+// 	// Parse connection status
+// 	// for _, line := range resp.Lines {
+// 	// 	if strings.HasPrefix(line, "+CIPSTATUS:") {
+// 	// 		parts := strings.Split(line[11:], ",")
+// 	// 		if len(parts) >= 4 {
+// 	// 			// Parse connection ID
+// 	// 			id, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+// 	// 			if err == nil && id >= 0 && id < MaxConnections {""
+// 	// 				// If we have this connection, update its state
+// 	// 				if d.connections[id] != nil {
+// 	// 					switch strings.Trim(parts[1], "\"") {
+// 	// 					case "TCP", "UDP":
+// 	// 						d.connections[id].State = StateConnected
+// 	// 					case "CLOSED":
+// 	// 						d.connections[id].State = StateClosed
+// 	// 						d.connections[id] = nil
+// 	// 					}
+// 	// 				}
+// 	// 			}
+// 	// 		}
+// 	// 	}
+// 	// }
 
-	return nil
-}
+// 	return nil
+// }
 
 // connectionSend sends data through a connection
 func (d *Device) connectionSend(id uint8, data []byte) (int, error) {
@@ -281,13 +292,17 @@ func (d *Device) connectionSend(id uint8, data []byte) (int, error) {
 
 		// Send command to prepare for data
 		cmd := fmt.Sprintf("+CIPSEND=%d,%d", id, size)
-		err := d.sendWithOptions(cmd, func(buffer []byte) bool {
-			return bytes.Contains(buffer, []byte(">"))
-		}, DefaultTimeout)
-		if err != nil {
-			return totalSent, fmt.Errorf("failed to send data: %w", err)
+		if err := d.sendRaw(cmd); err != nil {
+			return totalSent, err
 		}
 
+		t, err := d.readLine(DefaultTimeout)
+		if err != nil {
+			return totalSent, fmt.Errorf("failed to read prompt: %w", err)
+		}
+		if t != TokenPrompt {
+			return totalSent, ErrUnexpectedResponse
+		}
 		// Send data
 		_, err = d.uart.Write(data[offset : offset+size])
 		if err != nil {
@@ -295,12 +310,17 @@ func (d *Device) connectionSend(id uint8, data []byte) (int, error) {
 		}
 
 		// Wait for SEND OK response
-		if err := d.readResponse("", func(buffer []byte) bool {
+		if err := d.readResponse("", func(buffer []byte) error {
 			// Custom check function to look for SEND OK or SEND FAIL
-			return bytes.Contains(buffer, []byte("SEND OK")) ||
-				bytes.Contains(buffer, []byte("SEND FAIL"))
+			if bytes.Contains(buffer, []byte("SEND OK")) {
+				return nil
+			}
+			if bytes.Contains(buffer, []byte("SEND FAIL")) {
+				return ErrCannotSend
+			}
+			return ErrUnexpectedResponse
 		}, DefaultTimeout); err != nil {
-			return totalSent, fmt.Errorf("failed to read response: %w", err)
+			return totalSent, err
 		}
 
 		totalSent += size
@@ -310,42 +330,9 @@ func (d *Device) connectionSend(id uint8, data []byte) (int, error) {
 	return totalSent, nil
 }
 
-// contains checks if a is contained in b
-func contains(b, a []byte) bool {
-	return len(a) <= len(b) && len(a) > 0 && len(b) > 0 &&
-		bytes.Contains(b, a) // This relies on the bytes package imported in sim800l.go
-}
-
-// CheckNetworkRegistration verifies the network registration status
-// func (d *Device) CheckNetworkRegistration() (bool, error) {
-// 	err := d.send("+CREG?", DefaultTimeout)
-// 	if err != nil {
-// 		return false, err
-// 	}
-
-// 	// Parse registration status
-// 	// +CREG: 0,1 means registered to home network
-// 	// +CREG: 0,5 means registered to roaming network
-// 	if val, ok := resp.Values["+CREG"]; ok {
-// 		parts := strings.Split(val, ",")
-// 		if len(parts) >= 2 {
-// 			status := strings.TrimSpace(parts[1])
-// 			return status == "1" || status == "5", nil
-// 		}
-// 	}
-
-// 	return false, errors.New("could not parse registration status")
-// }
-
 // connectionRead implements reading data from a specific connection
 // Used internally by the Connection's Read method
-
 func (d *Device) connectionRead(id uint8, b []byte) (int, error) {
-	// Check if the connection exists
-	if id >= MaxConnections || d.connections[id] == nil {
-		return 0, ErrInvalidConnection
-	}
-
 	// Check if there's data available in the buffer
 	if d.recvBufLengths[id] == 0 {
 		// Try to check for new data from the device
@@ -379,156 +366,71 @@ func (d *Device) connectionRead(id uint8, b []byte) (int, error) {
 // checkForReceivedData checks for any new data received on any connection
 // This should be called periodically to process pending data notifications
 func (d *Device) checkForReceivedData(timeout time.Duration) error {
-	startTime := time.Now()
-	var buffer [256]byte // Fixed buffer size
-	end := 0
+	deadline := time.Now().Add(timeout)
 
 	// State machine variables
 	state := 0      // 0=looking for +RECEIVE, 1=reading data
 	cid := -1       // Current connection ID
 	dataLength := 0 // Expected data length
 
-	for time.Since(startTime) < timeout {
-		// Read available data into buffer
-		n, err := d.uart.Read(buffer[end:])
-		if err != nil {
-			return err
-		}
-
-		if n == 0 {
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-
-		end += n
-
-		// Handle buffer overflow
-		if end >= len(buffer) {
-			d.logger.Warn("buffer overflow, resetting")
-			end = 0
-			state = 0
-			continue
-		}
-
-		// Process buffer based on current state
+	for time.Since(deadline) < 0 {
 		switch state {
 		case 0: // Looking for +RECEIVE notification
 			// Try to find +RECEIVE
-			if idx := bytes.Index(buffer[:end], []byte("+RECEIVE")); idx >= 0 {
-				// Find colon after +RECEIVE
-				if colonIdx := bytes.Index(buffer[idx:end], []byte(":")); colonIdx >= 0 {
-					colonIdx += idx // Adjust to full buffer position
 
-					// Extract connection ID and length
-					paramStr := string(buffer[idx+9 : colonIdx]) // +RECEIVE, = 9 chars
-					params := strings.Split(paramStr, ",")
-					if len(params) >= 2 {
-						var parseErr error
-						cid, parseErr = strconv.Atoi(strings.TrimSpace(params[0]))
-						if parseErr != nil || cid < 0 || cid >= MaxConnections ||
-							d.connections[cid] == nil {
-							d.logger.Debug("invalid connection ID", "id", params[0])
-							// Reset buffer and continue looking
-							copy(buffer[:], buffer[colonIdx+1:end])
-							end -= (colonIdx + 1)
-							continue
-						}
-
-						dataLength, parseErr = strconv.Atoi(strings.TrimSpace(params[1]))
-						if parseErr != nil {
-							// Reset buffer and continue looking
-							copy(buffer[:], buffer[colonIdx+1:end])
-							end -= (colonIdx + 1)
-							continue
-						}
-
-						// Find the data start (after \r\n)
-						if crlfIdx := bytes.Index(buffer[colonIdx:end], []byte("\r\n")); crlfIdx >= 0 {
-							dataStartIdx := colonIdx + crlfIdx + 2 // +2 for \r\n
-
-							// Check how much data we already have
-							dataAvailable := end - dataStartIdx
-							dataToProcess := min(dataAvailable, dataLength)
-
-							// Copy available data to connection buffer
-							if dataToProcess > 0 {
-								// Check for buffer space
-								if d.recvBufLengths[cid]+dataToProcess > len(d.recvBuffers[cid]) {
-									// Not enough space, copy what fits
-									spaceLeft := len(d.recvBuffers[cid]) - d.recvBufLengths[cid]
-									if spaceLeft > 0 {
-										copy(d.recvBuffers[cid][d.recvBufLengths[cid]:],
-											buffer[dataStartIdx:dataStartIdx+spaceLeft])
-										d.recvBufLengths[cid] += spaceLeft
-									}
-									d.logger.Warn("receive buffer overflow",
-										"connection", cid,
-										"data_lost", dataToProcess-spaceLeft)
-								} else {
-									// Enough space, copy all data
-									copy(d.recvBuffers[cid][d.recvBufLengths[cid]:],
-										buffer[dataStartIdx:dataStartIdx+dataToProcess])
-									d.recvBufLengths[cid] += dataToProcess
-								}
-							}
-
-							// If we got all data, return success
-							if d.recvBufLengths[cid] >= dataLength {
-								return nil
-							}
-
-							// Otherwise, prepare for reading more data
-							state = 1
-							end = 0
-						}
-					}
-				}
+			t, err := d.readLine(DefaultTimeout)
+			if err != nil {
+				return err
 			}
+			if t != TokenLine {
+				return fmt.Errorf("unexpected token type: %v", t)
+			}
+			line := string(d.buffer[:d.end])
+			parts := strings.SplitN(line, ",", 3)
+			if len(parts) < 3 || !strings.HasPrefix(parts[0], "+RECEIVE") {
+				return fmt.Errorf("invalid +RECEIVE format: %s", line)
+			}
+
+			// Parse connection ID
+			cid, err = strconv.Atoi(strings.TrimSpace(parts[1]))
+			if err != nil || cid < 0 || cid >= MaxConnections {
+				return fmt.Errorf("invalid connection ID in +RECEIVE: %s", parts[1])
+			}
+			// Parse data length
+			end := strings.Index(parts[2], ":")
+			if end < 0 {
+				return fmt.Errorf("invalid +RECEIVE format, missing data length: %s", parts[2])
+			}
+			dataLength, err = strconv.Atoi(parts[2][:end]) // Remove trailing :
+			// Check if data length is valid
+			if err != nil || dataLength <= 0 {
+				return fmt.Errorf("invalid data length in +RECEIVE: %s", parts[2])
+			}
+			if dataLength > MaxBufferSize {
+				return fmt.Errorf("data length exceeds maximum buffer size: %d", dataLength)
+			}
+			state = 1 // Move to reading data state
+			// Reset the receive buffer for this connection
+			d.recvBufLengths[cid] = 0
 
 		case 1: // Reading data directly
-			// How much more data we need
-			remaining := dataLength - d.recvBufLengths[cid]
-			if remaining <= 0 {
-				return nil // We have all the data
+			// Read to to the expected data length
+			n, err := d.uart.Read(d.buffer[:])
+			if err != nil {
+				return fmt.Errorf("failed to read data for connection %d: %w", cid, err)
 			}
-
-			// Process available data
-			dataToRead := min(end, remaining)
-
-			// Check for buffer space
-			if d.recvBufLengths[cid]+dataToRead > len(d.recvBuffers[cid]) {
-				// Not enough space, copy what fits
-				spaceLeft := len(d.recvBuffers[cid]) - d.recvBufLengths[cid]
-				if spaceLeft > 0 {
-					copy(d.recvBuffers[cid][d.recvBufLengths[cid]:],
-						buffer[:spaceLeft])
-					d.recvBufLengths[cid] += spaceLeft
-				}
-				d.logger.Warn("receive buffer overflow",
-					"connection", cid,
-					"data_lost", dataToRead-spaceLeft)
-			} else {
-				// Enough space, copy all data
-				copy(d.recvBuffers[cid][d.recvBufLengths[cid]:],
-					buffer[:dataToRead])
-				d.recvBufLengths[cid] += dataToRead
+			n = min(n, dataLength)
+			// copy the data to the receive buffer and if are not done read one more time
+			if n > 0 {
+				copy(d.recvBuffers[cid][d.recvBufLengths[cid]:], d.buffer[:n])
+				d.recvBufLengths[cid] += n
+				dataLength -= n
 			}
-
-			// Move any remaining data to start of buffer
-			remaining = end - dataToRead
-			if remaining > 0 {
-				copy(buffer[:], buffer[dataToRead:end])
-				end = remaining
-			} else {
-				end = 0
-			}
-
-			// Check if we have all the data now
-			if d.recvBufLengths[cid] >= dataLength {
-				return nil
+			// Check if we have read enough data
+			if dataLength <= 0 {
+				return nil // Successfully read all expected data
 			}
 		}
 	}
-
 	return ErrTimeout
 }

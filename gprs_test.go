@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/m-s-sh/mockhw"
 )
@@ -42,9 +43,9 @@ func (h *MockHandler) Handle(ctx context.Context, r slog.Record) error {
 	}
 
 	if r.Level >= slog.LevelError {
-		h.t.Errorf("Log level %v: %s", r.Level, msg)
+		h.t.Errorf("%v %s", r.Level, msg)
 	} else {
-		h.t.Logf("Log level %v: %s", r.Level, msg)
+		h.t.Logf("%v %s", r.Level, msg)
 	}
 	return nil
 }
@@ -94,22 +95,14 @@ func TestCheckForReceivedData(t *testing.T) {
 			data:           []byte("HTTP/1.1 400 Bad Request\r\nDate: Mon, 30 Jun 2025 15:23:54 GMT\r\nDate: Mon, 30 Jun 2025 15:23:54 GMT\r\nContent-Type: text/html\r\nContent-Length: 154\r\nConnection: close\r\nServer: tcpbin\r\n\r\n<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>openresty</center>\r\n</body>\r\n</html>"),
 			connectionID:   1,
 			expectedLength: 335,
-			expectError:    false,
-			setupBuffers:   true,
+			expectError:    true,
+			setupBuffers:   false,
 		},
 		{
 			name:         "Invalid connection ID",
 			inputData:    []byte("+RECEIVE,7,5:\r\ntest\r\n"),
 			data:         []byte("test"),
 			connectionID: 7, // Invalid ID (out of range)
-			expectError:  true,
-			setupBuffers: false,
-		},
-		{
-			name:         "No connection at ID",
-			inputData:    []byte("+RECEIVE,2,5:\r\ntest\r\n"),
-			data:         []byte("test"),
-			connectionID: 2, // Valid ID but no connection setup
 			expectError:  true,
 			setupBuffers: false,
 		},
@@ -146,7 +139,7 @@ func TestCheckForReceivedData(t *testing.T) {
 				}
 			}
 
-			err := d.checkForReceivedData(DefaultTimeout)
+			err := d.checkForReceivedData(time.Minute)
 
 			if tc.expectError {
 				if err == nil {

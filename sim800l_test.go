@@ -8,6 +8,7 @@ package sim800l
 import (
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/m-s-sh/mockhw"
 )
@@ -45,10 +46,11 @@ func TestReadResponse(t *testing.T) {
 		shouldLogBuffer bool
 	}{
 		{
-			name:          "CGATT response",
-			responseData:  []byte("\r+CGATT: 1\r\nOK\r\n"),
-			expectCommand: "+CGATT",
-			expectValue:   "1",
+			name:            "CGATT response",
+			responseData:    []byte("\r+CGATT: 1\r\nOK\r\n"),
+			expectCommand:   "+CGATT",
+			expectValue:     "1",
+			shouldLogBuffer: true,
 		},
 		{
 			name:            "COPS response",
@@ -68,18 +70,18 @@ func TestReadResponse(t *testing.T) {
 				logger: slog.New(&MockHandler{t: t}),
 			}
 
-			err := d.readResponse(tc.expectCommand, nil, DefaultTimeout)
+			err := d.readResponse(tc.expectCommand, nil, time.Minute)
 			if err != nil {
 				t.Fatalf("Failed to read response: %v", err)
-			}
-
-			if tc.shouldLogBuffer {
-				t.Logf("Buffer content: %s", string(d.buffer[:d.end]))
 			}
 
 			value, ok := d.parseValue(tc.expectCommand)
 			if !ok || value != tc.expectValue {
 				t.Errorf("Expected value '%s', got '%s'", tc.expectValue, value)
+			}
+
+			if tc.shouldLogBuffer {
+				t.Logf("Buffer content: %s, value: %s", string(d.buffer[:d.end]), value)
 			}
 		})
 	}

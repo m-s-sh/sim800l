@@ -15,6 +15,48 @@ var (
 	ErrConnectionClosed         = errors.New("connection closed")
 )
 
+// ConnectionType represents different connection protocols
+type ConnectionType uint8
+
+func (ct ConnectionType) String() string {
+	switch ct {
+	case TCP:
+		return "TCP"
+	case UDP:
+		return "UDP"
+	default:
+		return "Unknown"
+	}
+}
+
+const (
+	TCP ConnectionType = iota
+	UDP
+)
+
+// ConnectionState represents the state of a connection
+type ConnectionState uint8
+
+const (
+	StateInitial ConnectionState = iota
+	StateConnecting
+	StateConnected
+	StateClosing
+	StateClosed
+	StateError
+)
+
+// Connection represents a single connection to a remote server
+type Connection struct {
+	ID         uint8           // Connection ID (0-5)
+	Type       ConnectionType  // Connection type (TCP/UDP)
+	State      ConnectionState // Current connection state
+	RemoteIP   string          // Remote IP address
+	RemotePort string          // Remote port
+	LocalPort  uint16          // Local port (if any)
+	Device     *Device         // Reference to parent device
+}
+
 // Connection represents a single connection to a remote server
 // Connection already defined in sim800l.go
 

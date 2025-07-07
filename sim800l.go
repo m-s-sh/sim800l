@@ -3,7 +3,6 @@
 package sim800l
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -18,65 +17,47 @@ const (
 	ConnectTimeout = time.Second * 75 // Longer timeout for connection operations
 	ResetTime      = time.Second * 3  // Time to hold reset pin high
 	StartupTime    = time.Second * 15 // Time to wait after reset
+	MaxBufferSize  = 256              // Maximum buffer size for UART operations
 	MaxConnections = 5                // SIM800L supports up to 6 connections (0-5)
-	CRLF           = "\r\n"           // Line terminator for commands
 	RecvBufSize    = 1024             // Buffer size for receiving data
-	OKText         = "OK"             // OK response text
-	ErrorText      = "ERROR"          // Error response text
+	OKToken        = "OK"             // OK response text
+	ErrorToken     = "ERROR"          // Error response text
 )
 
 // Common error types
 var (
-	ErrError         = errors.New("AT command error")
-	ErrTimeout       = errors.New("command timed out")
-	ErrNotConnected  = errors.New("not connected to network")
-	ErrNoIP          = errors.New("no IP address")
-	ErrBadParameter  = errors.New("invalid parameter")
-	ErrMaxConn       = errors.New("maximum connections reached")
-	ErrUnimplemented = errors.New("operation not implemented")
+	ErrError              = errors.New("AT command error")
+	ErrTimeout            = errors.New("command timed out")
+	ErrUnexpectedResponse = errors.New("unexpected response")
+	ErrNoIP               = errors.New("no IP address")
+	ErrBadParameter       = errors.New("invalid parameter")
+	ErrMaxConn            = errors.New("maximum connections reached")
+	ErrUnimplemented      = errors.New("operation not implemented")
+	ErrNotReady           = errors.New("device not ready or not responding, after reset")
 )
 
-// ConnectionType represents different connection protocols
-type ConnectionType uint8
+// ATError represents an error returned by an AT command
+type ATError struct {
+	Command string // The AT command that caused the error
+}
 
-func (ct ConnectionType) String() string {
-	switch ct {
-	case TCP:
-		return "TCP"
-	case UDP:
-		return "UDP"
-	default:
-		return "Unknown"
+// Error returns the error message, implementing the error interface
+func (e *ATError) Error() string {
+	if len(e.Command) == 0 {
+		return "AT command error"
 	}
+	return fmt.Sprintf("%s command error", e.Command)
 }
 
-const (
-	TCP ConnectionType = iota
-	UDP
-)
-
-// ConnectionState represents the state of a connection
-type ConnectionState uint8
+// TokenType represents the type of token parsed from AT command responses
+type TokenType int
 
 const (
-	StateInitial ConnectionState = iota
-	StateConnecting
-	StateConnected
-	StateClosing
-	StateClosed
-	StateError
+	TokenInvalid TokenType = iota
+	TokenLine
+	TokenPrompt // > prompt for data input
+	TokenEmpty  // Empty line
 )
-
-// Connection represents a single connection to a remote server
-type Connection struct {
-	ID         uint8           // Connection ID (0-5)
-	Type       ConnectionType  // Connection type (TCP/UDP)
-	State      ConnectionState // Current connection state
-	RemoteIP   string          // Remote IP address
-	RemotePort string          // Remote port
-	LocalPort  uint16          // Local port (if any)
-	Device     *Device         // Reference to parent device
-}
 
 // Device represents the SIM800L device itself
 type Device struct {
@@ -136,7 +117,7 @@ func (d *Device) Init() error {
 	// Execute initialization sequence
 
 	for _, cmd := range commands {
-		err = d.send(cmd, DefaultTimeout)
+		err = d.send(cmd)
 		if err != nil {
 			d.logger.Error("init failed on command", "command", cmd, "error", err)
 			return err // For TinyGo, we'll just return the original error
@@ -147,7 +128,7 @@ func (d *Device) Init() error {
 	}
 
 	// Get IMEI
-	err = d.send("+GSN", DefaultTimeout)
+	err = d.send("+GSN")
 	if err == nil {
 		d.IMEI = strings.TrimSpace(string(d.buffer[:d.end]))
 	}
@@ -156,7 +137,7 @@ func (d *Device) Init() error {
 }
 
 func (d *Device) Signal() int {
-	err := d.send("+CSQ", DefaultTimeout)
+	err := d.send("+CSQ")
 	if err != nil {
 		return 0
 	}
@@ -174,9 +155,9 @@ func (d *Device) HardReset() error {
 	time.Sleep(StartupTime)
 
 	// Check if device is responsive
-	err := d.send("AT", DefaultTimeout)
+	err := d.send("AT")
 	if err != nil {
-		return errors.New("module not responding after reset")
+		return ErrNotReady
 	}
 
 	return nil
@@ -184,16 +165,42 @@ func (d *Device) HardReset() error {
 
 // ResponseCheckFunc is a callback function type that can be used to check if
 // we have received a complete response and should stop reading
-type ResponseCheckFunc func(buffer []byte) bool
+type ResponseCheckFunc func(buffer []byte) error
 
-// send is a simplified version of sendWithOptions that always waits for OK pattern
-func (d *Device) send(cmd string, timeout time.Duration) error {
-	return d.sendWithOptions(cmd, nil, timeout)
+func defaultResponseCheck(buffer []byte) error {
+	// Default response check function that checks for OK or ERROR tokens
+	response := string(buffer)
+	if strings.Contains(response, OKToken) {
+		return nil // OK response
+	}
+	if strings.Contains(response, ErrorToken) {
+		return &ATError{Command: response} // Error response
+	}
+	return fmt.Errorf("unexpected response: %s", response) // Unexpected response
 }
 
-// sendWithOptions sends a command with customizable waiting behavior
+func (d *Device) send(cmd string) error {
+	// Use a default response check function that checks for OK or ERROR
+	return d.sendWithOptions(cmd, defaultResponseCheck, DefaultTimeout)
+}
+
+// send is a simplified version of sendWithOptions that always waits for OK pattern
 func (d *Device) sendWithOptions(cmd string, checkFunc ResponseCheckFunc, timeout time.Duration) error {
 
+	if err := d.sendRaw(cmd); err != nil {
+		return err
+	}
+
+	// Read and parse the response
+	if err := d.readResponse(cmd, checkFunc, timeout); err != nil {
+		d.logger.Error("command error", slog.Any("command", cmd), "ERROR", err)
+		return err
+	}
+
+	return nil
+}
+
+func (d *Device) sendRaw(cmd string) error {
 	// Clear UART buffer before sending
 	d.clearBuffer()
 
@@ -202,87 +209,28 @@ func (d *Device) sendWithOptions(cmd string, checkFunc ResponseCheckFunc, timeou
 		cmd = "AT" + cmd
 	}
 
-	// Log the command
-	//d.logger.Debug("sending command", slog.String("command", fullCmd))
-
 	// Send the command
-	_, err := d.uart.Write([]byte(cmd + CRLF))
+	_, err := d.uart.Write([]byte(cmd + "\r\n"))
 	if err != nil {
-		return err // For TinyGo, we'll just return the original error
+		return &ATError{Command: cmd}
 	}
-
-	// Read and parse the response
-	err = d.readResponse(cmd, checkFunc, timeout)
-	if err != nil {
-		d.logger.Debug("command error", slog.Any("command", cmd), "ERROR", err)
-		return err
-	}
-
 	return nil
 }
 
 // readResponse reads and parses the device response
-func (d *Device) readResponse(cmd string, checkResponse ResponseCheckFunc, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-
-	var rerr error
+func (d *Device) readResponse(cmd string, checkFunc ResponseCheckFunc, timeout time.Duration) error {
 	// Reset the raw length counter and clear the buffer
-	d.end = 0
-
-	for time.Now().Before(deadline) {
-		// Check for available data
-		if d.uart.Buffered() == 0 {
-			time.Sleep(1 * time.Millisecond)
-			continue
-		}
-
-		// Read a byte
-		n, err := d.uart.Read(d.buffer[d.end:])
-		if err != nil && n == 0 {
-			continue
-		}
-		d.end += n
-		b := d.buffer[:d.end]
-		if checkResponse != nil && checkResponse(b) {
-			// Custom check function is satisfied
-			break
-		} else if checkResponse == nil {
-			// Check for OK or ERROR responses
-			if bytes.Contains(b, []byte(ErrorText)) {
-				rerr = &ATError{
-					Command: cmd,
-					//Message: ErrorText,
-				}
-				break
-			}
-			if bytes.Contains(b, []byte(OKText)) {
-				break
-			}
-
-		}
-
-		//Check for CME/CMS errors (like "+CME ERROR: 10")
-		if d.end > 12 && (bytes.Contains(b, []byte("+CME ERROR:")) ||
-			bytes.Contains(b, []byte("+CMS ERROR:"))) {
-			msg := string(d.buffer[:d.end])
-			rerr = &ATError{
-				Command: cmd,
-			}
-			d.logger.Error("command error",
-				slog.String("command", cmd),
-				slog.String("error", msg),
-			)
-			break
-		}
+	t, err := d.readLine(timeout)
+	if err != nil {
+		return err
 	}
-
-	// Check for timeout or buffer overflow
-	if !time.Now().Before(deadline) {
-		return ErrTimeout
+	if t != TokenLine {
+		return &ATError{Command: cmd}
 	}
-
-	// Return any error found during response reading
-	return rerr
+	if checkFunc != nil {
+		return checkFunc(d.buffer[:d.end])
+	}
+	return nil // No custom check function provided, return nil
 }
 
 // parseErrorMessage extracts the error message from response containing CME/CMS errors
@@ -350,33 +298,92 @@ func (d *Device) parseValue(k string) (value string, ok bool) {
 	if start < 0 {
 		return "", false
 	}
-	end := strings.Index(string(d.buffer[start:d.end]), "\r\n")
-	if end < 0 {
-		end = d.end
-	} else {
-		end += start // Adjust end index relative to the start
+
+	start += len(k) + 1 // Move to the start of the value (after ":")
+	if start >= d.end {
+		return "", false // No value found after the key
 	}
-	start += len(k) + 1 // Move past the key and the colon
-	if start >= end {
-		return "", false
-	}
+
 	// Extract the value
-	value = strings.TrimSpace(string(d.buffer[start:end]))
+	value = strings.TrimSpace(string(d.buffer[start:d.end]))
 	if value == "" {
 		return "", false
 	}
 	return value, true
 }
 
-// ATError represents an error returned by an AT command
-type ATError struct {
-	Command string // The AT command that caused the error
+func (d *Device) readLine(t time.Duration) (TokenType, error) {
+	deadline := time.Now().Add(t)
+	d.end = 0 // Reset the end index of the buffer
+
+	var b [1]byte // single-byte read buffer
+	const (
+		stateStart   = 0
+		stateEndLine = 1
+	)
+	state := stateStart
+
+	for time.Now().Before(deadline) {
+		if d.uart.Buffered() == 0 {
+			time.Sleep(1 * time.Millisecond)
+			continue
+		}
+
+		n, err := d.uart.Read(b[:]) // directly read one byte
+		if err != nil {
+			break // or handle errors like io.EOF
+		}
+
+		if n == 0 {
+			time.Sleep(10 * time.Millisecond) // avoid busy waiting
+			continue                          // no data read, skip
+		}
+
+		switch state {
+		case stateStart:
+			if b[0] == '\r' {
+				state = stateEndLine
+				continue
+			}
+			if b[0] == '>' {
+				return TokenPrompt, nil // special prompt character
+			}
+			if err := d.append(b[0]); err != nil {
+				return TokenInvalid, err
+			}
+		case stateEndLine:
+			if b[0] == '\n' {
+				// Escape empty lines
+				if d.end <= 2 {
+					state = stateStart // reset state for next line
+					continue
+				}
+				return TokenLine, nil
+			} else {
+				d.end = 0 // Reset buffer if we receive a character after \r
+				// If we receive a character after \r, treat it as normal data
+				if err := d.append(b[0]); err != nil {
+					return TokenInvalid, err
+				}
+				state = stateStart // reset state for next line
+			}
+		}
+	}
+
+	// Check for timeout or buffer overflow
+	if !time.Now().Before(deadline) {
+		return TokenInvalid, ErrTimeout
+	}
+
+	return TokenInvalid, nil // no complete line found
 }
 
-// Error returns the error message, implementing the error interface
-func (e *ATError) Error() string {
-	if len(e.Command) == 0 {
-		return "AT command error"
+func (d *Device) append(b byte) error {
+	if d.end >= len(d.buffer) {
+		return errors.New("buffer overflow") // or handle as needed
 	}
-	return fmt.Sprintf("%s command error", e.Command)
+
+	d.buffer[d.end] = b
+	d.end++
+	return nil
 }
