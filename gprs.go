@@ -440,7 +440,7 @@ func (d *Device) checkForReceivedData(timeout time.Duration) error {
 			n = min(n, dataLength)
 			// copy the data to the receive buffer and if are not done read one more time
 			if n > 0 {
-				copy(d.recvBuffers[cid][d.recvBufLengths[cid]:], d.buffer[:n])
+				n = copy(d.recvBuffers[cid][d.recvBufLengths[cid]:], d.buffer[:n])
 				d.recvBufLengths[cid] += n
 				dataLength -= n
 			}

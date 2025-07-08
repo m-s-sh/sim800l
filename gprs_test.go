@@ -61,7 +61,7 @@ func (h *MockHandler) WithGroup(name string) slog.Handler {
 
 // Add any other logger methods that your interface requires
 
-func TestCheckForReceivedData(t *testing.T) {
+func Test_checkForReceivedData(t *testing.T) {
 	tests := []struct {
 		name           string
 		inputData      []byte

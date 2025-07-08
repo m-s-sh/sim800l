@@ -38,7 +38,7 @@ func (p *MockPin) Set(value bool) {
 	p.state = value
 }
 
-func TestReadResponse(t *testing.T) {
+func Test_readResponse(t *testing.T) {
 	tests := []struct {
 		name            string
 		responseData    []byte
@@ -88,7 +88,7 @@ func TestReadResponse(t *testing.T) {
 	}
 }
 
-func TestSendRaw(t *testing.T) {
+func Test_sendRaw(t *testing.T) {
 	uart := mockhw.NewUART(1000) // 1 second max delay
 	d := Device{
 		uart:   uart,

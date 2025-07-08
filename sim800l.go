@@ -231,16 +231,11 @@ func (d *Device) sendRaw(cmd []byte) error {
 	// Add AT prefix if needed.
 	if !bytes.HasPrefix(cmd, at) {
 		// Copy AT prefix to the beginning of buffer.
-		copy(d.buffer[:], at)
-		d.end += 2
+		d.end += copy(d.buffer[:], at)
 	}
 
-	// Copy command after AT prefix.
-	copy(d.buffer[d.end:], cmd)
-	d.end += len(cmd)
-	// Copy CR+LF to the end of the command.
-	copy(d.buffer[d.end:], crlf)
-	d.end += 2 // Update end index to include CR+LF.
+	d.end += copy(d.buffer[d.end:], cmd)
+	d.end += copy(d.buffer[d.end:], crlf)
 
 	// Write the command to the UART.
 	if _, err := d.uart.Write(d.buffer[:d.end]); err != nil {
