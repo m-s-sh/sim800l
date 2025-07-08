@@ -22,8 +22,10 @@ var (
 	cmdGetIp            = []byte("+CIFSR")     // Get local IP address
 	cmdShutPdp          = []byte("+CIPSHUT")   // Shut down PDP context
 	cmdConnStatusPrefix = []byte("+CIPSTATUS") // Connection status prefix
-	cmdConnStart        = []byte("+CIPSTART")  // Start connection command
-	cmdConnSend         = []byte("+CIPSEND")   // Send data command
+	cmdClipStart        = []byte("+CIPSTART")  // Start connection command
+	cmdClipClose        = []byte("+CIPCLOSE")  // Close connection command
+	cmdClipSend         = []byte("+CIPSEND")   // Send data command
+	cmdCstt             = []byte("+CSTT")      // Set APN command
 )
 
 var (
@@ -67,7 +69,7 @@ func (d *Device) Connect(apn, user, password string) error {
 	}
 
 	// Start wireless connection with specified APN
-	cmd := append(d.buffer[:0], "+CSTT="...)
+	cmd := append(d.buffer[:0], cmdCstt...)
 	if user != "" && password != "" {
 		cmd = fmt.Appendf(cmd, "\"%s\",\"%s\",\"%s\"", apn, user, password)
 	} else {
@@ -200,7 +202,7 @@ func (d *Device) Dial(network, address string) (net.Conn, error) {
 		return nil, fmt.Errorf("failed to start connection: %w", err)
 	}
 
-	if err := d.readResponse(cmdConnStart, func(buffer []byte) error {
+	if err := d.readResponse(cmdClipStart, func(buffer []byte) error {
 		// Custom check function to look for CONNECT OK or ALREADY CONNECT
 		if bytes.Contains(buffer, []byte("CONNECT OK")) {
 			return nil
@@ -232,7 +234,7 @@ func (d *Device) CloseConnection(cid uint8) error {
 	conn.state = StateClosing
 
 	// Send close command
-	cmd := append(d.buffer[:0], "+CIPCLOSE="...)
+	cmd := append(d.buffer[:0], cmdClipClose...)
 	cmd = strconv.AppendInt(cmd, int64(cid), 10)
 	err := d.send(cmd)
 
@@ -306,7 +308,7 @@ func (d *Device) connectionSend(id uint8, data []byte) (int, error) {
 		}
 
 		// Send command to prepare for data
-		cmd := append(d.buffer[:0], cmdConnSend...)
+		cmd := append(d.buffer[:0], cmdClipSend...)
 		cmd = strconv.AppendInt(cmd, int64(id), 10)
 		cmd = append(cmd, ',')
 		cmd = strconv.AppendInt(cmd, int64(size), 10)
@@ -387,13 +389,17 @@ func (d *Device) checkForReceivedData(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 
 	// State machine variables
-	state := 0      // 0=looking for +RECEIVE, 1=reading data
+	const (
+		stateStart = iota // 0=start looking for +RECEIVE, 1=reading data
+		stateFound        // 1=reading data directly
+	)
+	state := stateStart
 	cid := -1       // Current connection ID
 	dataLength := 0 // Expected data length
 
 	for time.Since(deadline) < 0 {
 		switch state {
-		case 0: // Looking for +RECEIVE notification
+		case stateStart: // Looking for +RECEIVE notification
 			// Try to find +RECEIVE
 
 			t, err := d.readLine(DefaultTimeout)
@@ -403,23 +409,23 @@ func (d *Device) checkForReceivedData(timeout time.Duration) error {
 			if t != TokenLine {
 				return fmt.Errorf("unexpected token type: %v", t)
 			}
-			line := string(d.buffer[:d.end])
-			parts := strings.SplitN(line, ",", 3)
-			if len(parts) < 3 || !strings.HasPrefix(parts[0], "+RECEIVE") {
+			line := (d.buffer[:d.end])
+			parts := bytes.Split(line, []byte(","))
+			if len(parts) < 3 || !bytes.HasPrefix(parts[0], []byte("+RECEIVE")) {
 				return fmt.Errorf("invalid +RECEIVE format: %s", line)
 			}
 
 			// Parse connection ID
-			cid, err = strconv.Atoi(strings.TrimSpace(parts[1]))
+			cid, err = strconv.Atoi(string(bytes.TrimSpace(parts[1])))
 			if err != nil || cid < 0 || cid >= MaxConnections {
 				return fmt.Errorf("invalid connection ID in +RECEIVE: %s", parts[1])
 			}
 			// Parse data length
-			end := strings.Index(parts[2], ":")
+			end := bytes.Index(parts[2], []byte(":"))
 			if end < 0 {
 				return fmt.Errorf("invalid +RECEIVE format, missing data length: %s", parts[2])
 			}
-			dataLength, err = strconv.Atoi(parts[2][:end]) // Remove trailing :
+			dataLength, err = strconv.Atoi(string(parts[2][:end])) // Remove trailing :
 			// Check if data length is valid
 			if err != nil || dataLength <= 0 {
 				return fmt.Errorf("invalid data length in +RECEIVE: %s", parts[2])
@@ -431,7 +437,7 @@ func (d *Device) checkForReceivedData(timeout time.Duration) error {
 			// Reset the receive buffer for this connection
 			d.recvBufLengths[cid] = 0
 
-		case 1: // Reading data directly
+		case stateFound: // Reading data directly
 			// Read to to the expected data length
 			n, err := d.uart.Read(d.buffer[:])
 			if err != nil {
