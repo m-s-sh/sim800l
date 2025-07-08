@@ -12,6 +12,20 @@ import (
 	"time"
 )
 
+// GPRS command constants
+var (
+	cmdGprsAttachQuery  = []byte("+CGATT?")    // Query GPRS attachment status
+	cmdGprsAttach       = []byte("+CGATT=1")   // Attach to GPRS service
+	cmdGprsDetach       = []byte("+CGATT=0")   // Detach from GPRS service
+	cmdMultiConn        = []byte("+CIPMUX=1")  // Enable multi-connection mode
+	cmdStartWireless    = []byte("+CIICR")     // Start wireless connection
+	cmdGetIp            = []byte("+CIFSR")     // Get local IP address
+	cmdShutPdp          = []byte("+CIPSHUT")   // Shut down PDP context
+	cmdConnStatusPrefix = []byte("+CIPSTATUS") // Connection status prefix
+	cmdConnStart        = []byte("+CIPSTART")  // Start connection command
+	cmdConnSend         = []byte("+CIPSEND")   // Send data command
+)
+
 var (
 	ErrWouldBlock    = errors.New("would block")
 	ErrCannotSend    = errors.New("cannot send data")
@@ -23,15 +37,15 @@ var (
 func (d *Device) Connect(apn, user, password string) error {
 
 	// Check if module is attached to GPRS service
-	err := d.send("+CGATT?")
+	err := d.send(cmdGprsAttachQuery)
 	if err != nil {
 		return fmt.Errorf("failed to check GPRS attachment: %w", err)
 	}
 
 	// Parse attachment status
 	attached := false
-	if val, ok := d.parseValue("+CGATT"); ok {
-		if val == "1" {
+	if val, ok := d.parseValue(cmdGprsAttach); ok {
+		if bytes.Equal(val, []byte("1")) {
 			attached = true
 		}
 	}
@@ -39,7 +53,7 @@ func (d *Device) Connect(apn, user, password string) error {
 	// If not attached, attach to GPRS service
 	if !attached {
 		d.logger.Info("not attached to GPRS, attaching now...")
-		err = d.send("+CGATT=1")
+		err = d.send(cmdGprsAttach)
 		if err != nil {
 			d.logger.Error("failed to attach to GPRS", "error", err)
 			return fmt.Errorf("failed to attach to GPRS: %w", err)
@@ -47,17 +61,17 @@ func (d *Device) Connect(apn, user, password string) error {
 	}
 
 	// Enable multi-connection mode
-	err = d.send("+CIPMUX=1")
+	err = d.send(cmdMultiConn)
 	if err != nil {
 		return fmt.Errorf("failed to enable multi-connection: %w", err)
 	}
 
 	// Start wireless connection with specified APN
-	var cmd string
+	cmd := append(d.buffer[:0], "+CSTT="...)
 	if user != "" && password != "" {
-		cmd = fmt.Sprintf("+CSTT=\"%s\",\"%s\",\"%s\"", apn, user, password)
+		cmd = fmt.Appendf(cmd, "\"%s\",\"%s\",\"%s\"", apn, user, password)
 	} else {
-		cmd = fmt.Sprintf("+CSTT=\"%s\"", apn)
+		cmd = fmt.Appendf(cmd, "\"%s\"", apn)
 	}
 
 	err = d.send(cmd)
@@ -66,13 +80,13 @@ func (d *Device) Connect(apn, user, password string) error {
 	}
 
 	// Start wireless connection
-	err = d.send("+CIICR")
+	err = d.send(cmdStartWireless)
 	if err != nil {
 		return fmt.Errorf("failed to bring up wireless connection: %w", err)
 	}
 
 	// Get local IP address - use custom mode that doesn't expect OK response
-	err = d.sendWithOptions("+CIFSR", func(buffer []byte) error {
+	err = d.sendWithOptions(cmdGetIp, func(buffer []byte) error {
 		// Custom check function to look for valid IP address
 		if buffer[len(buffer)-1] != '\n' {
 			return fmt.Errorf("invalid response format")
@@ -105,13 +119,13 @@ func (d *Device) Disconnect() error {
 	}
 
 	// Shut down PDP context
-	err := d.send("+CIPSHUT")
+	err := d.send(cmdShutPdp)
 	if err != nil {
 		return fmt.Errorf("failed to shut down PDP context: %w", err)
 	}
 
 	// Detach from GPRS service
-	err = d.send("+CGATT=0")
+	err = d.send(cmdGprsDetach)
 	if err != nil {
 		return fmt.Errorf("failed to detach from GPRS: %w", err)
 	}
@@ -164,7 +178,7 @@ func (d *Device) Dial(network, address string) (net.Conn, error) {
 	conn := &Connection{
 		ID:         uint8(cid),
 		Type:       connType,
-		State:      StateConnecting,
+		state:      StateConnecting,
 		RemoteIP:   host,
 		RemotePort: port,
 		Device:     d,
@@ -178,7 +192,7 @@ func (d *Device) Dial(network, address string) (net.Conn, error) {
 		networkType = "UDP"
 	}
 
-	cmd := fmt.Sprintf("+CIPSTART=%d,\"%s\",\"%s\",\"%s\"",
+	cmd := fmt.Appendf(d.buffer[:0], "+CIPSTART=%d,\"%s\",\"%s\",\"%s\"",
 		cid, networkType, host, port)
 
 	err = d.send(cmd)
@@ -186,7 +200,7 @@ func (d *Device) Dial(network, address string) (net.Conn, error) {
 		return nil, fmt.Errorf("failed to start connection: %w", err)
 	}
 
-	if err := d.readResponse("+CIPSTART", func(buffer []byte) error {
+	if err := d.readResponse(cmdConnStart, func(buffer []byte) error {
 		// Custom check function to look for CONNECT OK or ALREADY CONNECT
 		if bytes.Contains(buffer, []byte("CONNECT OK")) {
 			return nil
@@ -203,7 +217,7 @@ func (d *Device) Dial(network, address string) (net.Conn, error) {
 	}
 
 	// Connection successful
-	conn.State = StateConnected
+	conn.state = StateConnected
 	d.connections[cid] = conn
 	return conn, nil
 }
@@ -215,10 +229,11 @@ func (d *Device) CloseConnection(cid uint8) error {
 	}
 
 	conn := d.connections[cid]
-	conn.State = StateClosing
+	conn.state = StateClosing
 
 	// Send close command
-	cmd := fmt.Sprintf("+CIPCLOSE=%d", cid)
+	cmd := append(d.buffer[:0], "+CIPCLOSE="...)
+	cmd = strconv.AppendInt(cmd, int64(cid), 10)
 	err := d.send(cmd)
 
 	// Even if there was an error, mark the connection as closed
@@ -291,7 +306,10 @@ func (d *Device) connectionSend(id uint8, data []byte) (int, error) {
 		}
 
 		// Send command to prepare for data
-		cmd := fmt.Sprintf("+CIPSEND=%d,%d", id, size)
+		cmd := append(d.buffer[:0], cmdConnSend...)
+		cmd = strconv.AppendInt(cmd, int64(id), 10)
+		cmd = append(cmd, ',')
+		cmd = strconv.AppendInt(cmd, int64(size), 10)
 		if err := d.sendRaw(cmd); err != nil {
 			return totalSent, err
 		}
@@ -310,7 +328,7 @@ func (d *Device) connectionSend(id uint8, data []byte) (int, error) {
 		}
 
 		// Wait for SEND OK response
-		if err := d.readResponse("", func(buffer []byte) error {
+		if err := d.readResponse(nil, func(buffer []byte) error {
 			// Custom check function to look for SEND OK or SEND FAIL
 			if bytes.Contains(buffer, []byte("SEND OK")) {
 				return nil

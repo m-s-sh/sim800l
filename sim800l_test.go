@@ -6,6 +6,7 @@
 package sim800l
 
 import (
+	"bytes"
 	"log/slog"
 	"testing"
 	"time"
@@ -70,13 +71,13 @@ func TestReadResponse(t *testing.T) {
 				logger: slog.New(&MockHandler{t: t}),
 			}
 
-			err := d.readResponse(tc.expectCommand, nil, time.Minute)
+			err := d.readResponse([]byte(tc.expectCommand), nil, time.Minute)
 			if err != nil {
 				t.Fatalf("Failed to read response: %v", err)
 			}
 
-			value, ok := d.parseValue(tc.expectCommand)
-			if !ok || value != tc.expectValue {
+			value, ok := d.parseValue([]byte(tc.expectCommand))
+			if !ok || !bytes.Equal(value, []byte(tc.expectValue)) {
 				t.Errorf("Expected value '%s', got '%s'", tc.expectValue, value)
 			}
 
@@ -84,5 +85,27 @@ func TestReadResponse(t *testing.T) {
 				t.Logf("Buffer content: %s, value: %s", string(d.buffer[:d.end]), value)
 			}
 		})
+	}
+}
+
+func TestSendRaw(t *testing.T) {
+	uart := mockhw.NewUART(1000) // 1 second max delay
+	d := Device{
+		uart:   uart,
+		logger: slog.New(&MockHandler{t: t}),
+	}
+
+	data := []byte("+AABB")
+	err := d.sendRaw(data)
+	if err != nil {
+		t.Fatalf("Failed to send raw bytes: %v", err)
+	}
+
+	data = append([]byte("AT"), data...)
+	data = append(data, []byte("\r\n")...)
+	// Verify that the data was sent correctly
+	sentData := uart.TxBuffer()
+	if string(sentData) != string(data) {
+		t.Errorf("Expected sent data '%s', got '%s'", string(data), string(sentData))
 	}
 }

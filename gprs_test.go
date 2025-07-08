@@ -133,7 +133,7 @@ func TestCheckForReceivedData(t *testing.T) {
 				d.connections[tc.connectionID] = &Connection{
 					ID:         tc.connectionID,
 					Device:     &d,
-					State:      StateConnected,
+					state:      StateConnected,
 					RemoteIP:   "test.example.com",
 					RemotePort: "80",
 				}

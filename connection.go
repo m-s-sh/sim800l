@@ -50,7 +50,7 @@ const (
 type Connection struct {
 	ID         uint8           // Connection ID (0-5)
 	Type       ConnectionType  // Connection type (TCP/UDP)
-	State      ConnectionState // Current connection state
+	state      ConnectionState // Current connection state
 	RemoteIP   string          // Remote IP address
 	RemotePort string          // Remote port
 	LocalPort  uint16          // Local port (if any)
@@ -59,6 +59,10 @@ type Connection struct {
 
 // Connection represents a single connection to a remote server
 // Connection already defined in sim800l.go
+
+func (c *Connection) State() ConnectionState {
+	return c.state
+}
 
 // Read reads data from the connection
 // Implements the net.Conn interface
@@ -69,7 +73,7 @@ func (c *Connection) Read(b []byte) (int, error) {
 	}
 
 	// Check connection state
-	if c.State != StateConnected {
+	if c.state != StateConnected {
 		return 0, io.EOF
 	}
 
@@ -86,7 +90,7 @@ func (c *Connection) Write(b []byte) (int, error) {
 	}
 
 	// Check connection state
-	if c.State != StateConnected {
+	if c.state != StateConnected {
 		return 0, ErrConnectionNotEstablished
 	}
 
@@ -179,7 +183,7 @@ func (a simpleAddr) String() string {
 
 // IsConnected returns true if the connection is active
 func (c *Connection) IsConnected() bool {
-	return c != nil && c.State == StateConnected
+	return c != nil && c.state == StateConnected
 }
 
 // GetState returns the current connection state as a string
@@ -188,7 +192,7 @@ func (c *Connection) GetState() string {
 		return "INVALID"
 	}
 
-	switch c.State {
+	switch c.state {
 	case StateInitial:
 		return "INITIAL"
 	case StateConnecting:
