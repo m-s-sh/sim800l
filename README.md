@@ -18,6 +18,7 @@ _(this paragraph was written by human, about the rest not 100% sure)._
 - Hardware reset support
 - Detailed logging with slog
 - Custom response handling for special AT commands
+- Memory-optimized for constrained environments
 
 ## Basic Usage
 
@@ -73,77 +74,50 @@ This driver is specifically optimized for TinyGo and constrained environments:
 - Minimizes memory allocations during operation
 - Efficient buffer management for UART communication
 - Static allocation of response buffers and data structures
+- Uses internal device buffer for command construction to avoid allocations
 
 ## Custom Response Handling
 
-The driver supports custom response handling via callback functions:
+The driver includes built-in handlers for standard AT command responses. Most functionality is exposed through public methods that handle the underlying AT command communication for you.
 
 ```go
-// Define a custom response check function
-// This example looks for a specific text pattern in the response
-customCheck := func(buffer []byte) bool {
-    return bytes.Contains(buffer, []byte("MY_EXPECTED_RESPONSE"))
+// Check if the device is responsive
+if err := device.Init(); err != nil {
+    logger.Error("Device not responding", "error", err)
+    return
 }
 
-// Send a command with the custom check function
-resp, err := device.SendWithCustomCheck("+MYCMD", customCheck, sim800l.DefaultTimeout)
+// Get the current signal strength
+signalStrength := device.Signal() 
+logger.Info("Signal strength", "value", signalStrength)
+
+// Connect to GPRS
+if err := device.Connect("your-apn", "username", "password"); err != nil {
+    logger.Error("Failed to connect", "error", err)
+}
 ```
 
-This is particularly useful for:
-- Commands that don't return standard OK/ERROR responses
-- Waiting for specific URC (Unsolicited Result Code) messages
-- Custom protocols implemented over AT commands
-
-See the `/examples/custom_check` directory for a complete example.
+This abstraction handles all the complexities of AT command processing, response parsing, and error handling.
 
 ### Example Usage
 
 ```go
-// Get the device IP address using custom response handling
-ip, err := device.GetIP()
-if err != nil {
-    logger.Error("Failed to get IP address", "error", err)
-} else {
-    logger.Info("Device IP address", "ip", ip)
+// Check the network signal strength
+signalStrength := device.Signal()
+logger.Info("Current signal strength", "value", signalStrength)
+
+// Check network registration
+if err := device.Connect("your-apn", "", ""); err != nil {
+    if errors.Is(err, ErrNoIP) {
+        logger.Error("No IP address assigned")
+    } else {
+        logger.Error("Failed to connect", "error", err)
+    }
 }
 
-// Check GPRS status with custom response handling
-status, err := device.GetGPRSStatus()
-if err != nil {
-    logger.Error("Failed to get GPRS status", "error", err)
-} else {
-    logger.Info("GPRS status", "status", status)
-}
-```
-
-### Low-level API for Custom Responses
-
-For advanced users who need to send custom AT commands with special response handling:
-
-```go
-// Method 1: Use sendWithOptions with waitForOK=false
-// This collects all response data without expecting OK/ERROR
-resp, err := device.sendWithOptions("+CIFSR", false, DefaultTimeout, nil)
-if err != nil {
-    return err
-}
-
-// Method 2: Use sendWithCustomCheck with a custom response check function
-// This gives you complete control over when to stop reading
-ipCheck := func(buffer []byte) bool {
-    // Stop reading if we see a valid IP address pattern
-    return regexp.Match(`\d+\.\d+\.\d+\.\d+`, buffer)
-}
-resp, err := device.sendWithCustomCheck("+CIFSR", DefaultTimeout, ipCheck)
-if err != nil {
-    return err
-}
-
-// The response lines contain the actual data (like IP address)
-for _, line := range resp.Lines {
-    // Process the response data
-    fmt.Println("Response line:", line)
-}
+// Get device information
+logger.Info("Device IMEI", "imei", device.IMEI)
+logger.Info("Network operator", "operator", device.Operator)
 ```
 
 ## Network Connection Interface
@@ -172,83 +146,14 @@ if err != nil && err != io.EOF {
 fmt.Printf("Received %d bytes: %s\n", n, buffer[:n])
 ```
 
-## Connection Management
-
-Each SIM800L module can handle up to 5 simultaneous connections (IDs 0-4).
-The driver manages these connections automatically and provides buffer space for each connection.
-
-```go
-// Check network registration
-registered, err := device.CheckNetworkRegistration()
-if !registered {
-    logger.Error("Not registered to network")
-    return
-}
-
-// Check connection status
-err = device.GetConnectionStatus()
-if err != nil {
-    logger.Error("Failed to get connection status", "error", err)
-}
-
-// Disconnect from GPRS when done
-err = device.Disconnect()
-if err != nil {
-    logger.Error("Failed to disconnect", "error", err)
-}
-```
-
-## Handling Special Responses
-
-The SIM800L sometimes returns responses that don't follow the standard AT command pattern.
-For example, when receiving data from a connection, the module will send:
-
-```
-+RECEIVE,0,128:
-[128 bytes of data]
-```
-
-The driver handles these special cases automatically through the `checkForReceivedData` method,
-which parses incoming data notifications and places the received data into the appropriate connection buffer.
-
-## Error Handling
-
-The driver provides specific error types for common error conditions:
-
-```go
-var (
-    ErrTimeout       = errors.New("AT command timeout")
-    ErrError         = errors.New("AT command error")
-    ErrNotConnected  = errors.New("not connected to network")
-    ErrNoIP          = errors.New("no IP address")
-    ErrBadParameter  = errors.New("invalid parameter")
-    ErrMaxConn       = errors.New("maximum connections reached")
-    ErrUnimplemented = errors.New("operation not implemented")
-)
-```
-
-## Hardware Reset
-
-The driver supports hardware reset of the SIM800L module. This is useful for recovering from error states or initializing the module:
-
-```go
-// Perform hardware reset
-if err := device.HardReset(); err != nil {
-    logger.Error("Failed to reset module", "error", err)
-    return
-}
-
-// After reset, wait for module to stabilize
-// (The Init method already includes this reset and wait)
-```
-
 ## API Reference
 
 ### Device Creation and Configuration
 
-- `New(uart drivers.UART, resetPin machine.Pin, logger *slog.Logger) *Device` - Creates a new SIM800L device instance
+- `New(uart UART, resetPin Pin, logger *slog.Logger) *Device` - Creates a new SIM800L device instance
 - `Init() error` - Initializes the SIM800L device (includes hardware reset)
 - `HardReset() error` - Performs a hardware reset of the device
+- `Signal() int` - Returns the current signal strength (0-31, 99=unknown)
 
 ### Network and GPRS Connection
 
@@ -256,21 +161,12 @@ if err := device.HardReset(); err != nil {
 - `Disconnect() error` - Closes the GPRS connection
 - `Dial(network, address string) (net.Conn, error)` - Creates a TCP or UDP connection
 - `CloseConnection(id uint8) error` - Closes a specific connection by ID
-- `GetConnectionStatus() error` - Updates status of all connections
-- `CheckNetworkRegistration() (bool, error)` - Checks if registered to network
-- `GetIP() (string, error)` - Returns the current IP address
-- `GetGPRSStatus() (string, error)` - Returns the current GPRS connection state
 
-### Data Transfer
+### Device Information
 
-- `SendData(id uint8, data []byte) (int, error)` - Sends data through a connection
-- `ConnectionRead(id uint8, b []byte) (int, error)` - Reads data from a connection
-
-### Low-level AT Command Handling
-
-- `send(cmd string, timeout time.Duration) (*Response, error)` - Sends AT command with standard response handling
-- `sendWithOptions(cmd string, expectOK bool, timeout time.Duration, checkFunc ResponseCheckFunc) (*Response, error)` - Sends AT command with custom response handling
-- `sendWithCustomCheck(cmd string, timeout time.Duration, checkFunc ResponseCheckFunc) (*Response, error)` - Sends AT command with custom response completion check
+- `IMEI string` - Module IMEI number (available after Init)
+- `Operator string` - Network operator name
+- `IP string` - Current IP address (when connected to GPRS)
 
 ## License
 
